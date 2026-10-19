@@ -2957,7 +2957,7 @@ impl App {
         match ed.save(force) {
             Ok(trashed) => {
                 if trashed {
-                    self.undo.push(UndoEntry { label: format!("Edit {name}"), kind: UndoKind::Replaced(vec![ed.path.clone()]) });
+                    self.undo.push(UndoEntry { label: format!("Edit {name}"), kind: UndoKind::Replaced(vec![ed.file.clone()]) });
                 }
                 self.toast(format!("Saved {name}"));
                 true

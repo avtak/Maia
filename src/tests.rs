@@ -303,6 +303,43 @@ fn cross_device_move_keeps_original_when_something_was_skipped() {
     let _ = std::fs::remove_dir_all(&dst);
 }
 
+/// Saving from the preview keeps each line's ending: a file of CR LF lines is written back
+/// so, and one with both kinds keeps every line as it was (a script with one stray CR LF
+/// line must not come back all CR LF, where `#!/bin/sh\r` no longer runs).
+#[test]
+fn quick_edit_keeps_line_endings() {
+    use crate::quickedit::Edit;
+    let d = tmpdir("qe-eol");
+    let (mixed, dos) = (d.join("run.sh"), d.join("dos.txt"));
+    std::fs::write(&mixed, "#!/bin/sh\necho a\r\necho b\n").unwrap();
+    std::fs::write(&dos, "a\r\nb\r\n").unwrap();
+    let mut e = Edit::open(&mixed).unwrap();
+    e.text.push_str("echo c\n");
+    assert!(e.save(false).is_ok());
+    assert_eq!(std::fs::read_to_string(&mixed).unwrap(), "#!/bin/sh\necho a\r\necho b\necho c\n");
+    let mut e = Edit::open(&dos).unwrap();
+    assert_eq!(e.text, "a\nb\n");
+    e.text.push_str("c\n");
+    assert!(e.save(false).is_ok());
+    assert_eq!(std::fs::read_to_string(&dos).unwrap(), "a\r\nb\r\nc\r\n");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Saving a file opened through a symlink writes the file it points to and keeps the link.
+#[test]
+fn quick_edit_through_a_symlink_keeps_the_link() {
+    let d = tmpdir("qe-link");
+    let (real, link) = (d.join("real.txt"), d.join("link.txt"));
+    std::fs::write(&real, "old\n").unwrap();
+    std::os::unix::fs::symlink("real.txt", &link).unwrap();
+    let mut e = crate::quickedit::Edit::open(&link).unwrap();
+    e.text = "new\n".into();
+    assert!(e.save(false).is_ok());
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link was replaced by a file");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A finished move takes what it moved out of every listing that showed it, whichever
 /// tab it is in: a plain listing and a tree are read again, a flattened one drops the
 /// rows at once, the destination shows them, and a listing it did not touch stays put.

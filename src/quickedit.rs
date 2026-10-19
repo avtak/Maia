@@ -16,10 +16,14 @@ pub const MAX: u64 = 256 << 10;
 
 pub struct Edit {
     pub path: PathBuf,
+    /// The file a save writes: `path` with its links followed, so saving through a symlink
+    /// changes what it points to and keeps the link.
+    pub file: PathBuf,
     pub text: String,
     /// The file as read (modified, size): saving over a file changed since asks first.
     stamp: (Option<SystemTime>, u64),
-    /// Line breaks were CR LF, and are written back so.
+    /// Every line break was CR LF: edited as LF and written back as CR LF. A file with
+    /// both kinds keeps its CRs in the text, so each line is written back as it was.
     crlf: bool,
     /// What a Tab key inserts: a tab in a file indented with them, else four spaces.
     pub indent: &'static str,
@@ -52,13 +56,14 @@ impl Edit {
         }
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let mut text = String::from_utf8(bytes).map_err(|_| "Not UTF-8 text".to_string())?;
-        let crlf = text.contains("\r\n");
+        let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
         if crlf {
             text = text.replace("\r\n", "\n");
         }
         let indent = if text.lines().any(|l| l.starts_with('\t')) { "\t" } else { "    " };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Ok(Edit { path: path.to_path_buf(), saved: text.clone(), text, stamp: (m.modified().ok(), m.len()), crlf, indent, trashed: false, lang: crate::syntax::lang_for(&name), rev: 0, job: None, select: Some((0, 0)), focused: false })
+        let file = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        Ok(Edit { path: path.to_path_buf(), file, saved: text.clone(), text, stamp: (m.modified().ok(), m.len()), crlf, indent, trashed: false, lang: crate::syntax::lang_for(&name), rev: 0, job: None, select: Some((0, 0)), focused: false })
     }
 
     pub fn dirty(&self) -> bool {
@@ -68,12 +73,12 @@ impl Edit {
     /// Write the text over the file: beside it first, then renamed into place, keeping its
     /// permissions and tags. Returns whether the original went to the trash this time.
     pub fn save(&mut self, force: bool) -> Result<bool, SaveError> {
-        let m = std::fs::metadata(&self.path).ok();
+        let m = std::fs::metadata(&self.file).ok();
         if !force && m.as_ref().map(|m| (m.modified().ok(), m.len())) != Some(self.stamp) {
             return Err(SaveError::Changed);
         }
-        let dir = self.path.parent().ok_or_else(|| SaveError::Failed("No folder".into()))?;
-        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = self.file.parent().ok_or_else(|| SaveError::Failed("No folder".into()))?;
+        let name = self.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let part = crate::fsx::unique_dest(dir, &format!(".{name}.maia-part"));
         let body = if self.crlf { self.text.replace('\n', "\r\n") } else { self.text.clone() };
         let wrote = (|| {
@@ -84,7 +89,7 @@ impl Edit {
             if let Some(m) = &m {
                 std::fs::set_permissions(&part, m.permissions())?;
             }
-            crate::ops::copy_xattrs(&self.path, &part);
+            crate::ops::copy_xattrs(&self.file, &part);
             Ok::<(), std::io::Error>(())
         })();
         if let Err(e) = wrote {
@@ -92,10 +97,10 @@ impl Edit {
             return Err(SaveError::Failed(e.to_string()));
         }
         // The first save keeps the original in the trash, for Undo.
-        let trash = !self.trashed && m.is_some() && crate::trashcan::delete(&self.path).is_ok();
-        if let Err(e) = std::fs::rename(&part, &self.path) {
+        let trash = !self.trashed && m.is_some() && crate::trashcan::delete(&self.file).is_ok();
+        if let Err(e) = std::fs::rename(&part, &self.file) {
             if trash {
-                if let Some(it) = crate::picfix::newest_trashed(&self.path) {
+                if let Some(it) = crate::picfix::newest_trashed(&self.file) {
                     let _ = crate::trashcan::restore(&it);
                 }
             }
@@ -104,7 +109,7 @@ impl Edit {
         }
         self.trashed |= trash;
         self.saved = self.text.clone();
-        self.stamp = std::fs::metadata(&self.path).map(|m| (m.modified().ok(), m.len())).unwrap_or_default();
+        self.stamp = std::fs::metadata(&self.file).map(|m| (m.modified().ok(), m.len())).unwrap_or_default();
         Ok(trash)
     }
 
