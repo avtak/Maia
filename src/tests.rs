@@ -303,6 +303,58 @@ fn cross_device_move_keeps_original_when_something_was_skipped() {
     let _ = std::fs::remove_dir_all(&dst);
 }
 
+/// On SELinux a copy takes the label of where it lands, as `cp` does, and a move to
+/// another filesystem keeps its own, as `mv` does. A copy left with a label from ~/.ssh or
+/// /etc can be refused to the programs that should read it where it is now. Skipped
+/// without SELinux, or where this user can't relabel a file.
+#[test]
+fn copy_takes_the_selinux_label_of_where_it_lands() {
+    use std::os::unix::fs::MetadataExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let label = |p: &Path| -> Option<String> {
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::lgetxattr(c(p).as_ptr(), c"security.selinux".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).trim_end_matches('\0').to_string())
+    };
+    let set = |p: &Path, l: &str| unsafe { libc::lsetxattr(c(p).as_ptr(), c"security.selinux".as_ptr(), l.as_ptr().cast(), l.len(), 0) } == 0;
+    let ctx = egui::Context::default();
+    let d = tmpdir("selinux");
+    let (src, out) = (d.join("src/key.txt"), d.join("out"));
+    touch(&src, "k");
+    touch(&out.join("fresh.txt"), "f");
+    let (Some(fresh), Some(own)) = (label(&out.join("fresh.txt")), label(&src)) else {
+        let _ = std::fs::remove_dir_all(&d);
+        return; // no SELinux here
+    };
+    // Give the source a type of its own, as a file under ~/.ssh has.
+    let mut parts: Vec<&str> = own.split(':').collect();
+    if parts.len() < 4 {
+        return;
+    }
+    parts[2] = if parts[2] == "user_home_t" { "ssh_home_t" } else { "user_home_t" };
+    let odd = parts.join(":");
+    if !set(&src, &odd) {
+        let _ = std::fs::remove_dir_all(&d);
+        return; // this user may not relabel
+    }
+    let j = ops::spawn(1, OpKind::Copy { srcs: vec![src.clone()], dest: out.clone(), decide: HashMap::new() }, ctx.clone());
+    wait_job(&j);
+    assert_eq!(label(&out.join("key.txt")).as_deref(), Some(fresh.as_str()), "the copy kept its source's label");
+    // A move to another filesystem keeps the label.
+    let shm = Path::new("/dev/shm");
+    if std::fs::metadata(shm).is_ok_and(|m| m.dev() != std::fs::metadata(&d).unwrap().dev()) {
+        let to = shm.join(format!("maia-test-selinux-{}", std::process::id()));
+        std::fs::create_dir_all(&to).unwrap();
+        let j = ops::spawn(2, OpKind::Move { srcs: vec![src.clone()], dest: to.clone(), decide: HashMap::new() }, ctx);
+        wait_job(&j);
+        if to.join("key.txt").exists() {
+            assert_eq!(label(&to.join("key.txt")).as_deref(), Some(odd.as_str()), "the move lost its label");
+        }
+        let _ = std::fs::remove_dir_all(&to);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A finished move takes what it moved out of every listing that showed it, whichever
 /// tab it is in: a plain listing and a tree are read again, a flattened one drops the
 /// rows at once, the destination shows them, and a listing it did not touch stays put.

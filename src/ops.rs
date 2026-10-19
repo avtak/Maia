@@ -202,7 +202,7 @@ fn run(kind: &OpKind, p: &Mutex<Progress>, cancel: &Gate, ctx: &egui::Context) {
                 }
                 let merge = policy == Conflict::Merge && d.replace.is_none();
                 let fresh = fs::symlink_metadata(&d.to).is_err();
-                let r = copy_tree(s, &d.to, p, cancel, ctx, merge).and_then(|_| match &d.replace {
+                let r = copy_tree(s, &d.to, p, cancel, ctx, merge, false).and_then(|_| match &d.replace {
                     Some(t) => swap_in(&d.to, t),
                     None => Ok(()),
                 });
@@ -282,7 +282,7 @@ fn run(kind: &OpKind, p: &Mutex<Progress>, cancel: &Gate, ctx: &egui::Context) {
                 // Over something: written beside it and swapped in once whole.
                 let over = fs::symlink_metadata(d).is_ok();
                 let to = if over { unique_dest(d.parent().unwrap_or(d), &format!(".{}.maia-part", name_of(d))) } else { d.clone() };
-                match copy_tree(s, &to, p, cancel, ctx, false).and_then(|_| if over { swap_in(&to, d) } else { Ok(()) }) {
+                match copy_tree(s, &to, p, cancel, ctx, false, false).and_then(|_| if over { swap_in(&to, d) } else { Ok(()) }) {
                     Ok(()) => {
                         let mut g = p.lock().unwrap();
                         g.produced.push((s.clone(), d.clone()));
@@ -509,7 +509,7 @@ fn move_one(s: &PathBuf, dest: &Path, policy: Conflict, p: &Mutex<Progress>, can
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
             p.lock().unwrap().total_bytes += tree_size(s);
             let skipped = p.lock().unwrap().errors.len();
-            let r = copy_tree(s, &d.to, p, cancel, ctx, merge).and_then(|_| match &d.replace {
+            let r = copy_tree(s, &d.to, p, cancel, ctx, merge, true).and_then(|_| match &d.replace {
                 Some(t) => swap_in(&d.to, t),
                 None => Ok(()),
             });
@@ -758,6 +758,9 @@ fn copy_tree(
     cancel: &Gate,
     ctx: &egui::Context,
     merge: bool,
+    // A move keeps the SELinux label it had; a copy takes the one of where it lands, as
+    // with `cp` and `mv`.
+    label: bool,
 ) -> std::io::Result<()> {
     if cancel.stop() {
         return Err(std::io::Error::other("cancelled"));
@@ -800,16 +803,16 @@ fn copy_tree(
                     // A file over a file: written beside it, renamed over it once whole
                     // (a rename replaces in one step), so a failure keeps the old one.
                     let part = unique_dest(dst, &format!(".{}.maia-part", de.file_name().to_string_lossy()));
-                    if let Err(e) = copy_tree(&de.path(), &part, p, cancel, ctx, false).and_then(|_| fs::rename(&part, &child)) {
+                    if let Err(e) = copy_tree(&de.path(), &part, p, cancel, ctx, false, label).and_then(|_| fs::rename(&part, &child)) {
                         let _ = remove_tree(&part);
                         return Err(e);
                     }
                     continue;
                 }
             }
-            copy_tree(&de.path(), &child, p, cancel, ctx, merge)?;
+            copy_tree(&de.path(), &child, p, cancel, ctx, merge, label)?;
         }
-        copy_xattrs(src, dst);
+        xattrs(src, dst, label);
         fs::set_permissions(dst, m.permissions())?;
         if !merge
             && let (Ok(mt), Ok(d)) = (m.modified(), fs::File::open(dst))
@@ -828,7 +831,7 @@ fn copy_tree(
             return Err(e);
         }
         // Before the permissions: a read-only file takes no attributes.
-        copy_xattrs(src, dst);
+        xattrs(src, dst, label);
         fs::set_permissions(dst, m.permissions())?;
         if let Ok(mt) = m.modified() {
             let _ = w.set_modified(mt);
@@ -890,8 +893,16 @@ fn copy_data(r: &fs::File, w: &fs::File, len: u64, p: &Mutex<Progress>, cancel: 
 }
 
 /// Extended attributes (Maia's tags among them) copied over; those the target can't keep
-/// (another file system, or `security.*` without the right) are left behind.
+/// (another file system, or `security.*` without the right) are left behind. For a file
+/// written in place of `src`, so its SELinux label goes with it.
 pub fn copy_xattrs(src: &Path, dst: &Path) {
+    xattrs(src, dst, true);
+}
+
+/// `copy_xattrs`, with `security.*` (the SELinux label) only when `label`: a copy left
+/// with its source's label (from ~/.ssh, say) can be refused to the programs that should
+/// read it where it now is.
+fn xattrs(src: &Path, dst: &Path, label: bool) {
     use std::os::unix::ffi::OsStrExt;
     let (Ok(s), Ok(d)) = (std::ffi::CString::new(src.as_os_str().as_bytes()), std::ffi::CString::new(dst.as_os_str().as_bytes())) else { return };
     let mut names = vec![0u8; 1024];
@@ -907,7 +918,7 @@ pub fn copy_xattrs(src: &Path, dst: &Path) {
         return;
     }
     let mut val = vec![0u8; 4096];
-    for name in names[..n as usize].split(|&b| b == 0).filter(|n| !n.is_empty()) {
+    for name in names[..n as usize].split(|&b| b == 0).filter(|n| !n.is_empty() && (label || !n.starts_with(b"security."))) {
         let Ok(name) = std::ffi::CString::new(name) else { continue };
         let mut len = unsafe { libc::lgetxattr(s.as_ptr(), name.as_ptr(), val.as_mut_ptr().cast(), val.len()) };
         if len < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ERANGE) {
