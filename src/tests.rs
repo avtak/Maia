@@ -8429,6 +8429,32 @@ fn diffs_side_by_side() {
     assert_eq!(changed_span("é1", "é2"), ((2, 3), (2, 3)), "cut at character boundaries");
 }
 
+/// A folder here that can't be read must not look empty: everything in its twin there
+/// would be "only there", and Mirror would trash it. It is left out of the plan and named.
+#[test]
+fn sync_leaves_unreadable_folders_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("sync-unread");
+    let (a, b) = (d.join("a"), d.join("b"));
+    touch(&a.join("photos/1.jpg"), "1");
+    touch(&b.join("photos/1.jpg"), "1");
+    touch(&b.join("photos/2.jpg"), "2");
+    touch(&a.join("new.txt"), "n");
+    let perms = |m| std::fs::set_permissions(a.join("photos"), std::fs::Permissions::from_mode(m)).unwrap();
+    perms(0o000);
+    if std::fs::read_dir(a.join("photos")).is_ok() {
+        perms(0o755); // root reads it anyway: nothing to test
+        let _ = std::fs::remove_dir_all(&d);
+        return;
+    }
+    let p = crate::compare::plan(&a, &b, &std::sync::atomic::AtomicBool::new(false));
+    perms(0o755);
+    assert!(p.extra.is_empty(), "would trash {:?}", p.extra);
+    assert_eq!(p.unread, vec![a.join("photos")]);
+    assert_eq!(p.copy, vec![(a.join("new.txt"), b.join("new.txt"))]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// Sync all the way down: what the other side lacks copied, newer files over older ones
 /// (the older to the trash), mirroring sends what only it has to the trash, folders that
 /// differ inside are found, and Undo puts it all back as one step.

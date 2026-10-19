@@ -4757,7 +4757,7 @@ fn sync(app: &mut App, ctx: &egui::Context, st: &mut crate::compare::SyncState) 
             dialog_buttons(ui, |ui| close = plain_button(ui, "Cancel", &pal).clicked());
             return;
         };
-        if plan.copy.is_empty() && plan.update.is_empty() && plan.extra.is_empty() {
+        if plan.copy.is_empty() && plan.update.is_empty() && plan.extra.is_empty() && plan.unread.is_empty() {
             ui.label(egui::RichText::new("Both sides are the same already").color(pal.text_dim));
             dialog_buttons(ui, |ui| close = primary_button(ui, "Close", true, &pal).clicked());
             return;
@@ -4777,6 +4777,9 @@ fn sync(app: &mut App, ctx: &egui::Context, st: &mut crate::compare::SyncState) 
             }
             if !plan.update.is_empty() {
                 dot(ui, crate::gitstatus::GREEN, format!("{} here, replacing the older ones there (to the trash)", count(plan.update.len(), "newer file", "newer files")));
+            }
+            if !plan.unread.is_empty() {
+                dot(ui, pal.danger, if plan.unread.len() == 1 { "1 folder couldn't be read, so nothing in it changes".to_string() } else { format!("{} folders couldn't be read, so nothing in them changes", plan.unread.len()) });
             }
             if extra > 0 {
                 let text = egui::RichText::new(format!("Mirror: also move {} only there to the trash", count(extra, "item", "items"))).color(if st.mirror { pal.danger } else { pal.text });

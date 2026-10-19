@@ -146,6 +146,10 @@ pub struct Plan {
     /// Only there.
     pub extra: Vec<PathBuf>,
     pub bytes: u64,
+    /// Folders on either side that couldn't be read in full, left out of the plan: one
+    /// that only looked empty would make all of its twin "only there", and Mirror would
+    /// trash it.
+    pub unread: Vec<PathBuf>,
 }
 
 /// Plan syncing `from` into `to`, all the way down.
@@ -159,12 +163,22 @@ fn walk(from: &Path, to: &Path, p: &mut Plan, stop: &AtomicBool) {
     if stop.load(Ordering::Relaxed) {
         return;
     }
-    let list = |d: &Path| -> Vec<(std::ffi::OsString, std::fs::Metadata)> {
-        let mut v: Vec<_> = std::fs::read_dir(d).map(|rd| rd.flatten().filter_map(|e| Some((e.file_name(), std::fs::symlink_metadata(e.path()).ok()?))).collect()).unwrap_or_default();
+    let list = |d: &Path| -> std::io::Result<Vec<(std::ffi::OsString, std::fs::Metadata)>> {
+        let mut v = vec![];
+        for e in std::fs::read_dir(d)? {
+            let e = e?;
+            v.push((e.file_name(), std::fs::symlink_metadata(e.path())?));
+        }
         v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
+        Ok(v)
     };
-    let (here, there) = (list(from), list(to));
+    let (here, there) = match (list(from), list(to)) {
+        (Ok(here), Ok(there)) => (here, there),
+        (here, _) => {
+            p.unread.push(if here.is_err() { from } else { to }.to_path_buf());
+            return;
+        }
+    };
     let by: HashMap<&std::ffi::OsString, &std::fs::Metadata> = there.iter().map(|(n, m)| (n, m)).collect();
     for (name, m) in &here {
         let (src, dst) = (from.join(name), to.join(name));
