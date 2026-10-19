@@ -412,7 +412,7 @@ pub fn mounts_in(table: &Path) -> Vec<Mount> {
             && !mp.starts_with("/root")
             && fs != "swap";
         let removable = mp.starts_with("/run/media") || mp.starts_with("/media") || mp.starts_with("/mnt");
-        if (wanted || removable || fs == "fuse.sshfs" || fs == "cifs" || fs == "nfs" || fs == "nfs4")
+        if (wanted || removable || matches!(fs, "fuse.sshfs" | "fuse.rclone" | "cifs" | "nfs" | "nfs4"))
             && !out.iter().any(|m| m.path == Path::new(&mp))
         {
             out.push(Mount { device: dev.to_string(), path: PathBuf::from(mp), fstype: fs.to_string() });

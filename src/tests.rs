@@ -262,6 +262,22 @@ fn copy_keeps_tags_dates_and_bytes() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Network filesystems mounted by the user show in the sidebar beside the disks: sshfs,
+/// rclone (Google Drive, S3, ...), CIFS and NFS. Other FUSE mounts stay out.
+#[test]
+fn mounts_include_network_filesystems() {
+    let d = tmpdir("mounts");
+    let table = d.join("mounts");
+    touch(&table, "/dev/nvme0n1p3 / btrfs rw 0 0\n\
+gdrive: /home/u/gdrive fuse.rclone rw,nosuid,nodev 0 0\n\
+u@host:/srv /home/u/host fuse.sshfs rw 0 0\n\
+portal /run/user/1000/doc fuse.portal rw 0 0\n\
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n");
+    let got: Vec<String> = crate::fsx::mounts_in(&table).into_iter().map(|m| m.path.display().to_string()).collect();
+    assert_eq!(got, ["/", "/home/u/gdrive", "/home/u/host"]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A finished move takes what it moved out of every listing that showed it, whichever
 /// tab it is in: a plain listing and a tree are read again, a flattened one drops the
 /// rows at once, the destination shows them, and a listing it did not touch stays put.
