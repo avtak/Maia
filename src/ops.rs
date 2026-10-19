@@ -683,7 +683,7 @@ fn resolve_dest(src: &Path, dest_dir: &Path, conflict: &Conflict, p: &Mutex<Prog
     if !exists || target == src {
         return Some(Dest { to: if exists { unique_dest(dest_dir, &name) } else { target }, replace: None });
     }
-    let newer = || fs::metadata(src).and_then(|m| m.modified()).ok() > fs::metadata(&target).and_then(|m| m.modified()).ok().and_then(|t| t.checked_add(std::time::Duration::from_secs(1)));
+    let newer = || crate::compare::newer(fs::metadata(src).and_then(|m| m.modified()).ok(), fs::metadata(&target).and_then(|m| m.modified()).ok());
     match conflict {
         Conflict::KeepBoth | Conflict::Rename(_) => Some(Dest { to: unique_dest(dest_dir, &name), replace: None }),
         Conflict::Newer if !newer() => {

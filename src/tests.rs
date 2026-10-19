@@ -8474,6 +8474,47 @@ fn sync_plans_copies_and_undoes() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Syncing a folder with one inside it is refused: a parent synced into its child would
+/// copy the child into itself, and a child mirrored over its parent would send itself to
+/// the trash as "only there". The same folder on both sides plans nothing, as before.
+#[test]
+fn sync_refuses_nested_folders() {
+    use crate::compare::{Plan, nested, plan};
+    let d = tmpdir("sync-nested");
+    touch(&d.join("notes.txt"), "n");
+    touch(&d.join("backup/notes.txt"), "n");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let p = plan(&d.join("backup"), &d, &stop);
+    assert!(!p.extra.contains(&d.join("backup")), "Mirror would trash the source: {:?}", p.extra);
+    assert_eq!(p, Plan::default());
+    assert_eq!(plan(&d, &d.join("backup"), &stop), Plan::default());
+    assert!(nested(&d, &d.join("backup")) && nested(&d.join("backup"), &d));
+    assert!(!nested(&d, &d) && !nested(&d.join("backup"), &d.join("notes.txt")));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// FAT (most USB sticks and SD cards) keeps a file's time only to two seconds, so a copy
+/// there can look up to two seconds older than its original. That is not "newer", or
+/// every sync would copy the file again; three seconds is.
+#[test]
+fn sync_allows_fat_two_second_times() {
+    let d = tmpdir("sync-fat");
+    let (a, b) = (d.join("a"), d.join("b"));
+    for f in ["fat.txt", "edited.txt"] {
+        touch(&a.join(f), "x");
+        touch(&b.join(f), "x");
+    }
+    let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let set = |p: &Path, t| std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+    set(&a.join("fat.txt"), t + Duration::from_millis(1500));
+    set(&b.join("fat.txt"), t);
+    set(&a.join("edited.txt"), t + Duration::from_secs(3));
+    set(&b.join("edited.txt"), t);
+    let p = crate::compare::plan(&a, &b, &std::sync::atomic::AtomicBool::new(false));
+    assert_eq!(p.update, vec![(a.join("edited.txt"), b.join("edited.txt"))]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A terminal `cols` × `rows` after a program wrote `bytes`.
 fn vt(cols: usize, rows: usize, bytes: &[u8]) -> crate::vt::Term {
     let mut t = crate::vt::Term::new(cols, rows);

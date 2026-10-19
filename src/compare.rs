@@ -42,10 +42,20 @@ impl Drop for Pair {
     }
 }
 
-/// Is `a`'s file newer than `b`'s? A second of slack: some filesystems keep times only to
-/// the second (or two).
-fn newer(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>) -> bool {
-    a > b.and_then(|t| t.checked_add(Duration::from_secs(1)))
+/// Is `a`'s file newer than `b`'s? Two seconds of slack: some filesystems keep times only
+/// to the second, and FAT (most USB sticks and SD cards) only to two, so a copy there can
+/// look up to two seconds older than its original and would be copied again every time.
+pub(crate) fn newer(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>) -> bool {
+    a > b.and_then(|t| t.checked_add(Duration::from_secs(2)))
+}
+
+/// One folder inside the other, links followed: a sync would copy the destination into
+/// itself, or with Mirror send the source (or a folder holding it) to the trash as "only
+/// there". The same folder on both sides is not nested: there is nothing to sync.
+pub fn nested(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (a, b) = (real(a), real(b));
+    a != b && (a.starts_with(&b) || b.starts_with(&a))
 }
 
 thread_local! {
@@ -151,6 +161,9 @@ pub struct Plan {
 /// Plan syncing `from` into `to`, all the way down.
 pub fn plan(from: &Path, to: &Path, stop: &AtomicBool) -> Plan {
     let mut p = Plan::default();
+    if nested(from, to) {
+        return p;
+    }
     walk(from, to, &mut p, stop);
     p
 }
@@ -210,6 +223,7 @@ pub fn run(app: &mut App, cmd: Cmd) {
             let t = app.tab();
             t.selected = t.view.iter().copied().filter(|&i| mark(&t.entries[i as usize].path).is_some()).collect();
         }
+        Cmd::SyncPanels if nested(&path, &dest) => app.toast("Can't sync a folder with one inside it"),
         Cmd::SyncPanels => app.popup = crate::popups::Popup::Sync(Box::new(SyncState::start(path, dest, &app.ctx))),
         // Folders still being looked through may yet differ inside.
         _ if n == 0 && !looking => app.toast("No differences"),
