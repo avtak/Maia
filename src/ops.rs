@@ -232,15 +232,18 @@ fn run(kind: &OpKind, p: &Mutex<Progress>, cancel: &Gate, ctx: &egui::Context) {
         }
         OpKind::Move { srcs, dest, decide } => {
             p.lock().unwrap().total_items = srcs.len();
+            let mut later = vec![];
             for s in srcs {
                 if cancel.stop() {
                     break;
                 }
-                move_one(s, dest, decide.get(s).cloned().unwrap_or(Conflict::KeepBoth), p, cancel, ctx);
+                move_one(s, dest, decide.get(s).cloned().unwrap_or(Conflict::KeepBoth), p, cancel, ctx, &mut later);
             }
+            finish_moves(later, p);
         }
         OpKind::Sort { moves, .. } => {
             p.lock().unwrap().total_items = moves.len();
+            let mut later = vec![];
             for (s, dest) in moves {
                 if cancel.stop() {
                     break;
@@ -262,8 +265,9 @@ fn run(kind: &OpKind, p: &Mutex<Progress>, cancel: &Gate, ctx: &egui::Context) {
                     }
                     p.lock().unwrap().made.extend(new.into_iter().rev());
                 }
-                move_one(s, dest, Conflict::KeepBoth, p, cancel, ctx);
+                move_one(s, dest, Conflict::KeepBoth, p, cancel, ctx, &mut later);
             }
+            finish_moves(later, p);
         }
         OpKind::Sync { copies, remove } => {
             {
@@ -478,8 +482,9 @@ impl Changed {
     }
 }
 
-/// Move `s` into `dest`, recording what it became (or why it couldn't).
-fn move_one(s: &PathBuf, dest: &Path, policy: Conflict, p: &Mutex<Progress>, cancel: &Gate, ctx: &egui::Context) {
+/// Move `s` into `dest`, recording what it became (or why it couldn't). A move to another
+/// filesystem is a copy whose original is deleted by `finish_moves`, once queued in `later`.
+fn move_one(s: &PathBuf, dest: &Path, policy: Conflict, p: &Mutex<Progress>, cancel: &Gate, ctx: &egui::Context, later: &mut Vec<Later>) {
     if s.parent() == Some(dest) {
         p.lock().unwrap().done_items += 1;
         return; // moving onto itself is a no-op
@@ -500,9 +505,10 @@ fn move_one(s: &PathBuf, dest: &Path, policy: Conflict, p: &Mutex<Progress>, can
             }),
             None => Ok(()),
         },
-        // Cross-device: copy, put in place, and only then delete the original.
+        // Cross-device: copy and put in place; the original goes later.
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
             p.lock().unwrap().total_bytes += tree_size(s);
+            let skipped = p.lock().unwrap().errors.len();
             let r = copy_tree(s, &d.to, p, cancel, ctx, merge).and_then(|_| match &d.replace {
                 Some(t) => swap_in(&d.to, t),
                 None => Ok(()),
@@ -510,30 +516,86 @@ fn move_one(s: &PathBuf, dest: &Path, policy: Conflict, p: &Mutex<Progress>, can
             if r.is_err() && fresh {
                 let _ = remove_tree(&d.to);
             }
-            r.and_then(|_| remove_tree(s))
+            // Something inside was skipped (a special file, an unreadable entry): the copy
+            // is not the whole of it, so the original stays beside it.
+            let whole = || {
+                if p.lock().unwrap().errors.len() > skipped {
+                    return Err(std::io::Error::other("not all of it could be copied, so the original was kept"));
+                }
+                Ok(())
+            };
+            match r.and_then(|_| whole()) {
+                Ok(()) => {
+                    later.push(Later { src: s.clone(), dest: dest.to_path_buf(), landed: d.landed().to_path_buf(), replaced: d.replace.clone() });
+                    p.lock().unwrap().done_items += 1;
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(e) => Err(e),
+            }
         }
         Err(e) => Err(e),
     };
+    record_move(p, s, r, d.landed(), d.replace.clone());
+    p.lock().unwrap().done_items += 1;
+    ctx.request_repaint();
+}
+
+/// A cross-device move whose copy is whole and in place, waiting for its original to go.
+struct Later {
+    src: PathBuf,
+    dest: PathBuf,
+    landed: PathBuf,
+    replaced: Option<PathBuf>,
+}
+
+/// Delete the originals of cross-device moves, once their copies are on the destination's
+/// disk and not only in the page cache, where a write error (a stick pulled out) would
+/// surface after the original was gone. One syncfs per destination, not one per item:
+/// each waits on the device, and moving a thousand photos to a stick is a thousand items.
+fn finish_moves(later: Vec<Later>, p: &Mutex<Progress>) {
+    let mut flushed: Vec<(PathBuf, Result<(), String>)> = vec![];
+    for l in later {
+        let f = match flushed.iter().find(|(d, _)| *d == l.dest) {
+            Some((_, f)) => f.clone(),
+            None => {
+                let f = syncfs(&l.dest).map_err(|e| format!("the copy may not be on the disk yet, so the original was kept: {e}"));
+                flushed.push((l.dest.clone(), f.clone()));
+                f
+            }
+        };
+        let r = f.map_err(std::io::Error::other).and_then(|_| remove_tree(&l.src));
+        record_move(p, &l.src, r, &l.landed, l.replaced);
+    }
+}
+
+fn syncfs(dir: &Path) -> std::io::Result<()> {
+    let f = fs::File::open(dir)?;
+    match unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&f)) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// What a finished move did, for the listings and Undo, or why it failed.
+fn record_move(p: &Mutex<Progress>, s: &Path, r: std::io::Result<()>, landed: &Path, replaced: Option<PathBuf>) {
+    let mut g = p.lock().unwrap();
     match r {
         Ok(()) => {
-            let mut g = p.lock().unwrap();
-            g.gone.push(s.clone());
-            g.produced.push((s.clone(), d.landed().to_path_buf()));
-            g.replaced.extend(d.replace.clone());
+            g.gone.push(s.to_path_buf());
+            g.produced.push((s.to_path_buf(), landed.to_path_buf()));
+            g.replaced.extend(replaced);
         }
         Err(e) => {
-            let mut g = p.lock().unwrap();
             if crate::admin::denied(&e) {
-                g.denied.push(s.clone());
+                g.denied.push(s.to_path_buf());
             }
             if crate::holders::is_busy(&e) {
-                g.busy.push(s.clone());
+                g.busy.push(s.to_path_buf());
             }
             g.errors.push(format!("{}: {e}", s.display()));
         }
     }
-    p.lock().unwrap().done_items += 1;
-    ctx.request_repaint();
 }
 
 /// Extract into a hidden staging folder beside the results, then move each top-level
@@ -718,7 +780,16 @@ fn copy_tree(
         if !(merge && dst.is_dir()) {
             fs::create_dir(dst)?;
         }
-        for de in fs::read_dir(src)?.flatten() {
+        for de in fs::read_dir(src)? {
+            // An entry that can't be read is reported rather than silently left out, and
+            // the rest is still copied; a move then keeps its original.
+            let de = match de {
+                Ok(de) => de,
+                Err(e) => {
+                    p.lock().unwrap().errors.push(format!("{}: {e}", src.display()));
+                    continue;
+                }
+            };
             let child = dst.join(de.file_name());
             let there = fs::symlink_metadata(&child).ok();
             if merge && there.as_ref().is_some_and(|m| !m.is_dir()) {

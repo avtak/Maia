@@ -278,6 +278,47 @@ gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n");
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A move to another filesystem copies, then deletes the original. If part of it could
+/// not be copied (a FIFO is skipped), the original must stay. Needs /dev/shm on a
+/// different filesystem from the temp folder; skipped otherwise.
+#[test]
+fn cross_device_move_keeps_original_when_something_was_skipped() {
+    use std::os::unix::fs::MetadataExt;
+    let ctx = egui::Context::default();
+    let src = tmpdir("xdev");
+    let shm = Path::new("/dev/shm");
+    match std::fs::metadata(shm) {
+        Ok(m) if m.dev() != std::fs::metadata(&src).unwrap().dev() => {}
+        _ => return,
+    }
+    let dst = shm.join(format!("maia-test-xdev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dst);
+    std::fs::create_dir_all(&dst).unwrap();
+    touch(&src.join("box/a.txt"), "a");
+    let pipe = std::ffi::CString::new(src.join("box/pipe").as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+    let j = ops::spawn(1, OpKind::Move { srcs: vec![src.join("box")], dest: dst.clone(), decide: HashMap::new() }, ctx.clone());
+    wait_job(&j);
+    assert!(src.join("box/a.txt").exists(), "original deleted although the FIFO was not copied");
+    assert!(!j.progress.lock().unwrap().errors.is_empty());
+    // With nothing left to skip, the move completes: every original goes once its copy is
+    // on the disk, and each lands once, ready for Undo.
+    std::fs::remove_file(src.join("box/pipe")).unwrap();
+    std::fs::remove_dir_all(dst.join("box")).unwrap();
+    touch(&src.join("c.txt"), "c");
+    let j = ops::spawn(2, OpKind::Move { srcs: vec![src.join("box"), src.join("c.txt")], dest: dst.clone(), decide: HashMap::new() }, ctx);
+    wait_job(&j);
+    assert!(!src.join("box").exists() && std::fs::read_to_string(dst.join("box/a.txt")).unwrap() == "a");
+    assert!(!src.join("c.txt").exists() && std::fs::read_to_string(dst.join("c.txt")).unwrap() == "c");
+    let g = j.progress.lock().unwrap();
+    assert!(g.errors.is_empty(), "{:?}", g.errors);
+    assert_eq!(g.produced, [(src.join("box"), dst.join("box")), (src.join("c.txt"), dst.join("c.txt"))]);
+    assert_eq!(g.gone, [src.join("box"), src.join("c.txt")]);
+    drop(g);
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
 /// A finished move takes what it moved out of every listing that showed it, whichever
 /// tab it is in: a plain listing and a tree are read again, a flattened one drops the
 /// rows at once, the destination shows them, and a listing it did not touch stays put.
