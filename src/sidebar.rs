@@ -227,6 +227,12 @@ pub fn refresh(app: &App, ctx: &egui::Context) {
             let mounts = fsx::mounts_in(&table)
                 .into_iter()
                 .filter(|m| !remote_dirs.contains(&m.path))
+                .filter({
+                    // One row per partition: btrfs subvolumes (Fedora's / and /home) share
+                    // their device and space, so the first mount (/, "Root") stands for it.
+                    let mut seen = std::collections::HashSet::new();
+                    move |m: &fsx::Mount| !m.device.starts_with("/dev/") || seen.insert(m.device.clone())
+                })
                 .map(|m| {
                     let (t, f) = fsx::disk_space(&m.path).unwrap_or((0, 0));
                     (m.path.clone(), tab::volume_label(&m.device, &m.path), t, f)
