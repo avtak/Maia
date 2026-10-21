@@ -43,6 +43,7 @@ pub enum Mode {
     Tree,
     List,
     Icons(f32),
+    Columns,
 }
 
 /// Zoom stops of the named views: the slider runs Details 0%, Tree 10%, List 20%,
@@ -82,8 +83,19 @@ pub fn mode_for(z: f32) -> Mode {
     }
 }
 
+/// The view a tab shows: Columns, or the one its zoom names.
+pub fn mode_of(s: &crate::config::ViewSettings) -> Mode {
+    if s.column_view { Mode::Columns } else { mode_for(s.zoom) }
+}
+
+/// The name of the view a tab shows (footer chip, View popup).
+pub fn view_label(s: &crate::config::ViewSettings) -> &'static str {
+    if s.column_view { "Columns" } else { view_name(s.zoom) }
+}
+
 pub fn view_name(z: f32) -> &'static str {
     match mode_for(z) {
+        Mode::Columns => "Columns",
         Mode::Details => "Details",
         Mode::Tree => "Tree",
         Mode::List => "List",
@@ -122,6 +134,14 @@ pub fn paint_view_glyph(p: &egui::Painter, r: Rect, mode: Mode, col: Color32) {
             }
         }
         Mode::Icons(_) => theme::paint_glyph(p, r, theme::Glyph::Pics, col),
+        Mode::Columns => {
+            // Three panes side by side.
+            p.rect_stroke(r.shrink(0.5), CornerRadius::same(1), st, StrokeKind::Inside);
+            for f in [0.36, 0.7] {
+                let x = (l + w * f).round() + 0.5;
+                p.line_segment([pos2(x, t + 0.5), pos2(x, r.bottom() - 0.5)], st);
+            }
+        }
     }
 }
 
@@ -248,6 +268,21 @@ fn paint_tags(ui: &Ui, x: f32, y: f32, tags: &(Vec<Color32>, String), font: &Fon
     }
 }
 
+/// The Tags column: the dots, then the words cut to the room left.
+fn tags_cell(ui: &Ui, r: Rect, tags: &(Vec<Color32>, String), font: &FontId, dim: Color32, ring: Color32) {
+    let rad = (font.size * 0.28).clamp(3.0, 5.0);
+    // As many dots as fit, the words after them when room is left.
+    let fit = (((r.width() + 2.5) / (rad * 2.0 + 2.5)).floor() as usize).min(tags.0.len());
+    let mut x = r.left();
+    if fit > 0 {
+        x += paint_dots(ui.painter(), x, r.center().y, &tags.0[..fit], rad, ring) + 6.0;
+    }
+    if !tags.1.is_empty() && r.right() - x > 16.0 {
+        let g = elided(ui, &tags.1, FontId::proportional(font.size - 1.5), r.right() - x, dim);
+        ui.painter().galley(pos2(x, r.center().y - g.size().y / 2.0), g, dim);
+    }
+}
+
 /// A matched line after the name, with the words it matched in the accent colour.
 fn append_match(job: &mut LayoutJob, line: &str, needle: &str, font: &FontId, dim: Color32, accent: Color32) {
     let fmt = |c: Color32| egui::TextFormat { font_id: font.clone(), color: c, ..Default::default() };
@@ -276,7 +311,8 @@ pub fn listing(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
     // Ctrl+wheel → zoom, one step per notch (fine-grained touchpad scrolling accumulates
     // into whole notches).
     let hover = ui.ctx().pointer_hover_pos().map(|p| rect.contains(p)).unwrap_or(false);
-    if hover {
+    // (Columns has no zoom: its rows follow the font size.)
+    if hover && !t.settings.column_view {
         let zd = ui.input(|i| i.zoom_delta());
         if (zd - 1.0).abs() > 0.0001 {
             // egui turns a wheel notch into `line_scroll_speed` points and zooms by
@@ -311,12 +347,20 @@ pub fn listing(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
     let q = fuzzy::Query::new(if t.content.on { "" } else { &name });
     let mut ui = ui.new_child(UiBuilder::new().max_rect(rect).id_salt(("listing", env.panel_id, t.id)));
     ui.set_clip_rect(rect.intersect(ui.clip_rect()));
-    match mode_for(t.shown_zoom) {
-        Mode::Details | Mode::Tree => details(&mut ui, rect, t, env, &q),
-        Mode::List => grid(&mut ui, rect, t, env, &q, Mode::List),
-        m @ Mode::Icons(_) => grid(&mut ui, rect, t, env, &q, m),
+    let mut er = rect;
+    if t.settings.column_view {
+        er = columns(&mut ui, rect, t, env, &q);
+    } else {
+        t.strip = None;
+        match mode_for(t.shown_zoom) {
+            Mode::Details | Mode::Tree => details(&mut ui, rect, t, env, &q),
+            Mode::List => grid(&mut ui, rect, t, env, &q, Mode::List),
+            m @ Mode::Icons(_) => grid(&mut ui, rect, t, env, &q, m),
+            Mode::Columns => {}
+        }
     }
-    // Empty states.
+    // Empty states (in the Columns view, in the tab's own column).
+    let rect = er;
     if t.view.is_empty() && !t.is_loading() {
         let msg = if let Some(e) = &t.error {
             format!("Can't open this folder: {}", fsx::plain_error(e))
@@ -461,6 +505,10 @@ fn abbrev(n: u64) -> String {
     }
 }
 
+/// The item clicked last, by path: a double-click is two clicks on the same item (the
+/// first may have been in another column of the Columns view).
+static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Selection / activation / context menu / drag for one item.
 fn handle_item(ui: &Ui, resp: &Response, idx: u32, t: &mut Tab, env: &mut Env) {
     let mods = ui.input(|i| i.modifiers);
@@ -502,7 +550,6 @@ fn handle_item(ui: &Ui, resp: &Response, idx: u32, t: &mut Tab, env: &mut Env) {
         env.actions.push(Action::Activate { panel: env.panel_id, idx, mods });
     }
     // egui takes any two quick clicks for a double-click; here both must land on this item.
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let this = Id::new(&path).value();
     let double = resp.double_clicked() && LAST.load(std::sync::atomic::Ordering::Relaxed) == this;
     if resp.clicked() {
@@ -800,6 +847,8 @@ fn details(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query
     let col_w = |c: Column, w: f32| if c == Column::Name { w + spare } else { w };
     let computer = tab::is_computer(&t.path);
     let tree = t.tree_active();
+    // With a Tags column the name leaves them to it.
+    let tag_col = cols.iter().any(|(c, _)| *c == Column::Tags);
     // Usage needs the parent's total.
     let needs_usage = cols.iter().any(|(c, _)| *c == Column::Usage);
     let parent_total: u64 = if needs_usage {
@@ -943,7 +992,7 @@ fn details(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query
                                     let name = display_name(&e, env.cfg);
                                     let rel = e.rel();
                                     let suffix = rel.as_deref().and_then(|r| std::path::Path::new(r).parent()).filter(|p| !p.as_os_str().is_empty()).map(|p| format!("› {}", p.display()));
-                                    let tags = if computer { None } else { row_tags(&e.path) };
+                                    let tags = if computer || tag_col { None } else { row_tags(&e.path) };
                                     let room = tags.as_ref().map_or(0.0, |tg| tags_width(ui, tg, &font));
                                     let mut job = name_job(&name, suffix.as_deref(), q, &font, dimc(pal.text), dimc(sub), acc, (name_r.width() - room).max(24.0), 1);
                                     // The line that matched, after the name (elided with it).
@@ -992,6 +1041,11 @@ fn details(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query
                                     ui.painter().text(bar.center(), Align2::CENTER_CENTER, label, FontId::proportional(env.cfg.font_size - 2.5), pal.text);
                                 }
                             }
+                            Column::Tags => {
+                                if let Some(tg) = row_tags(&e.path) {
+                                    tags_cell(ui, inner, &tg, &font, dimc(sub), ring);
+                                }
+                            }
                             other => {
                                 let txt = match other {
                                     Column::Type => type_text(&e, t),
@@ -1005,6 +1059,9 @@ fn details(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query
                                     Column::Files => if e.is_dir { env.stats.map.get(&e.path).map(|s| abbrev(s.files)).unwrap_or_else(|| if e.is_link { "--".into() } else { String::new() }) } else { "--".into() },
                                     Column::Permissions => fsx::fmt_mode(e.mode, e.is_dir),
                                     Column::Extension => e.ext().to_string(),
+                                    Column::Taken => fmt_date(crate::facts::get(&e).and_then(|f| f.taken), env.cfg),
+                                    Column::Dimensions => crate::facts::get(&e).and_then(|f| f.dims).map(crate::facts::fmt_dims).unwrap_or_default(),
+                                    Column::Duration => crate::facts::get(&e).and_then(|f| f.duration).map(crate::media::fmt_time).unwrap_or_default(),
                                     _ => String::new(),
                                 };
                                 let g = elided(ui, &txt, small.clone(), inner.width(), dimc(sub));
@@ -1165,7 +1222,7 @@ fn grid(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query, m
             let cols = ((body.width() / cw).floor() as usize).max(1);
             (vec2(cw, s + text_h + 16.0), cols, 0, false)
         }
-        Mode::Details | Mode::Tree => unreachable!(),
+        Mode::Details | Mode::Tree | Mode::Columns => unreachable!(),
     };
     // Spread leftover width between icon cells (items keep their size).
     let gap = if let Mode::Icons(_) = mode { ((body.width() - cols as f32 * cell.x) / cols as f32).max(0.0) } else { 0.0 };
@@ -1359,7 +1416,7 @@ fn grid(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query, m
                     }
                     item_checkbox(ui, Rect::from_min_size(r.min + vec2(7.0, 7.0), Vec2::splat(15.0)), idx, ui.rect_contains_pointer(r), t, env);
                 }
-                Mode::Details | Mode::Tree => {}
+                Mode::Details | Mode::Tree | Mode::Columns => {}
             }
         }
         if t.scroll_to_cursor {
@@ -1375,4 +1432,331 @@ fn grid(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query, m
         }
     });
     t.current_scroll = if horizontal { 0.0 } else { out.state.offset.y };
+}
+
+// ------------------------------------------------------------------ columns
+
+/// A column's width: room for about thirty characters of a name, growing with the font
+/// size and the Spacing option.
+pub fn column_width(cfg: &Config) -> f32 {
+    (cfg.font_size * 16.0 + 56.0 * cfg.spacing).round()
+}
+
+/// The Columns view: the strip's folders side by side, the tab's own among them, scrolled
+/// to keep it (and the folder under its cursor) in sight. Returns the tab's column, where
+/// the empty and error states go.
+fn columns(ui: &mut Ui, rect: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query) -> Rect {
+    {
+        let c = tab::ViewCtx { show_hidden: env.cfg.show_hidden, show_system: env.cfg.show_system, folders_first: env.cfg.folders_first, recents_on_top: env.cfg.recents_on_top, recents: env.recents, stats: &env.stats.map };
+        crate::columns::sync(t, &c);
+    }
+    let Some(mut st) = t.strip.take() else { return rect };
+    let w = column_width(env.cfg).min(rect.width().max(60.0));
+    let focus = st.chain.len();
+    let n = focus + 1 + usize::from(st.preview.is_some());
+    let end = (n as f32 * w - rect.width()).max(0.0);
+    // When the columns change, scroll as little as keeps the tab's column and the one
+    // after it in sight (the tab's own wins in a narrow panel). In between, the wheel
+    // moves freely along the strip.
+    let key = Id::new((&t.path, &st.preview, (w * 4.0) as i32, (rect.width() * 4.0) as i32)).value();
+    let changed = std::mem::replace(&mut st.laid_for, key) != key;
+    if changed || !st.placed {
+        // After a click the clicked column holds still: only its own must be in sight.
+        let (lo, hi) = (focus as f32 * w, if st.held { (focus + 1) as f32 * w } else { n as f32 * w });
+        let mut x = st.target;
+        if hi - x > rect.width() {
+            x = hi - rect.width();
+        }
+        if lo < x {
+            x = lo;
+        }
+        st.target = if st.held { x.max(0.0) } else { x.clamp(0.0, end) };
+    }
+    if ui.rect_contains_pointer(rect) {
+        let dx = ui.input(|i| i.smooth_scroll_delta.x);
+        if dx != 0.0 {
+            st.target = (st.target - dx).clamp(0.0, end.max(st.target));
+            st.scroll = st.target;
+        }
+    }
+    if !st.placed || !env.cfg.animations || (st.scroll - st.target).abs() < 0.5 {
+        st.scroll = st.target;
+        st.placed = true;
+    } else {
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        st.scroll += (st.target - st.scroll) * (dt * 20.0).min(1.0);
+        ui.ctx().request_repaint();
+    }
+    t.hscroll = 0.0;
+    let mut own = rect;
+    for k in 0..n {
+        let cr = Rect::from_min_size(pos2(rect.left() + k as f32 * w - st.scroll.round(), rect.top()), vec2(w, rect.height()));
+        let vis = cr.intersect(rect);
+        if !vis.is_positive() {
+            continue;
+        }
+        let mut cui = ui.new_child(UiBuilder::new().max_rect(cr).id_salt(("col", t.id, k)));
+        cui.set_clip_rect(vis.intersect(ui.clip_rect()));
+        if k == focus {
+            own = vis;
+            own_column(&mut cui, cr, t, env, q, &mut st.own_target);
+        } else {
+            let path = if k < focus { st.chain[k].clone() } else { st.preview.clone().unwrap_or_default() };
+            if let Some(i) = st.cols.iter().position(|c| c.tab.path == path) {
+                let child = st.cols[i].child.filter(|_| k < focus);
+                side_column(&mut cui, cr, &mut st.cols[i].tab, child, env);
+            }
+        }
+        ui.painter().with_clip_rect(rect).line_segment([pos2(cr.right() - 0.5, rect.top()), pos2(cr.right() - 0.5, rect.bottom())], Stroke::new(1.0, env.pal.border));
+    }
+    t.strip = Some(st);
+    own
+}
+
+/// What a column row shows: icon, name (the filter's letters marked) and, for a
+/// folder, the chevron leading on. `icon` false when something else took its place.
+#[allow(clippy::too_many_arguments)]
+fn column_cells(ui: &Ui, r: Rect, ic: Rect, e: &Entry, env: &Env, q: &fuzzy::Query, selected: bool, faded: bool, icon: bool, git: Option<&crate::gitstatus::Repo>) {
+    let pal = env.pal;
+    let font = FontId::proportional(env.cfg.font_size);
+    let dimc = |c: Color32| if faded { c.gamma_multiply(0.45) } else { c };
+    if icon {
+        let mut ip = ui.painter().clone();
+        if faded {
+            ip.multiply_opacity(0.45);
+        }
+        if !crate::icons::entry(&ip, ic, e) {
+            theme::paint_icon(&ip, ic, theme::categorize(&e.ext(), e.is_dir, e.is_executable()), "", e.is_link);
+        }
+    }
+    crate::gitstatus::paint(ui.painter(), ic, git, &e.path, pal);
+    let (sub, acc, ring) = sel_colors(pal, selected);
+    let chev = e.is_dir && tab::drive_dev(&e.path).is_none();
+    let recent = env.cfg.highlight_recents && env.recents.contains(&e.path);
+    // From the right: the chevron (as big as the text asks), the recents dot, the name.
+    let cs = (env.cfg.font_size * 0.72).clamp(9.0, 15.0);
+    let chev_w = if chev { cs + 10.0 } else { 6.0 };
+    let dot_x = r.right() - chev_w - 4.0;
+    let name_r = Rect::from_min_max(pos2(ic.right() + 7.0, r.top()), pos2(if recent { dot_x - 6.0 } else { r.right() - chev_w - 2.0 }, r.bottom()));
+    let tags = row_tags(&e.path);
+    let room = tags.as_ref().map_or(0.0, |tg| tags_width(ui, tg, &font));
+    let rel = e.rel();
+    let suffix = rel.as_deref().and_then(|r| std::path::Path::new(r).parent()).filter(|p| !p.as_os_str().is_empty()).map(|p| format!("› {}", p.display()));
+    let job = name_job(&display_name(e, env.cfg), suffix.as_deref(), q, &font, dimc(pal.text), dimc(sub), acc, (name_r.width() - room).max(24.0), 1);
+    let g = ui.fonts_mut(|f| f.layout_job(job));
+    let gw = g.size().x;
+    ui.painter().galley(pos2(name_r.left(), r.center().y - g.size().y / 2.0), g, pal.text);
+    if let Some(tg) = &tags {
+        paint_tags(ui, name_r.left() + gw, r.center().y, tg, &font, sub, ring);
+    }
+    if chev {
+        let cr = Rect::from_center_size(pos2(r.right() - 6.0 - cs / 2.0, r.center().y), Vec2::splat(cs));
+        theme::paint_glyph(ui.painter(), cr, theme::Glyph::ChevronRight, dimc(if selected { pal.on_sel_dim() } else { pal.text_dim }));
+    }
+    if recent {
+        ui.painter().circle_filled(pos2(dot_x, r.center().y), 2.5, pal.accent.gamma_multiply(0.8));
+    }
+}
+
+/// The tab's own column: everything a List view row does (selection, rubber band,
+/// rename, drag and drop, menus), one folder tall.
+fn own_column(ui: &mut Ui, cr: Rect, t: &mut Tab, env: &mut Env, q: &fuzzy::Query, eased: &mut Option<f32>) {
+    let pal = *env.pal;
+    let font = FontId::proportional(env.cfg.font_size);
+    let row_h = row_height(env.cfg);
+    let body = cr.shrink2(vec2(4.0, 4.0));
+    t.page_items = ((body.height() / row_h).floor() as usize).max(1);
+    t.nav_row_step = 1;
+    t.nav_col_step = 0;
+    let computer = tab::is_computer(&t.path);
+    let git = crate::gitstatus::repo_for(&t.path);
+    let dim_ignored = env.cfg.git_ignored == crate::config::IgnoredFiles::Dim && git.as_ref().is_some_and(|r| !crate::gitstatus::inside_ignored(r, &t.path));
+    let mut sa = egui::ScrollArea::vertical().id_salt(("colv", t.id)).auto_shrink([false, false]);
+    let view = t.view.clone();
+    // The cursor kept in sight by an offset worked out here and eased toward, in the
+    // views' motion: egui's own scroll-to works from a delta that goes stale when a second
+    // request comes while the first still moves (End right after Home stopped short).
+    if t.scroll_to_cursor {
+        t.scroll_to_cursor = false;
+        if let Some(i) = t.cursor.and_then(|c| view.iter().position(|&x| x == c)) {
+            let (top, bottom, h) = (i as f32 * row_h, (i + 1) as f32 * row_h, body.height());
+            let cur = eased.unwrap_or(t.current_scroll);
+            let to = if top < cur { top } else if bottom > cur + h { bottom - h } else { cur };
+            let to = to.clamp(0.0, (view.len() as f32 * row_h - h).max(0.0));
+            if (to - t.current_scroll).abs() > 0.5 {
+                *eased = Some(to);
+            }
+        }
+    }
+    if let Some(s) = t.restore_scroll.take() {
+        *eased = None;
+        sa = sa.vertical_scroll_offset(s);
+    } else if let Some(to) = *eased {
+        let cur = t.current_scroll;
+        let next = if !env.cfg.animations || (to - cur).abs() < 1.0 {
+            *eased = None;
+            to
+        } else {
+            ui.ctx().request_repaint();
+            cur + (to - cur) * (ui.input(|i| i.stable_dt).min(0.05) * 30.0).min(1.0)
+        };
+        sa = sa.vertical_scroll_offset(next);
+    }
+    let mut body_ui = ui.new_child(UiBuilder::new().max_rect(body));
+    let out = sa.show_viewport(&mut body_ui, |ui, vp| {
+        let content_h = (view.len() as f32 * row_h).max(vp.height() - 1.0);
+        let (crect, bg) = ui.allocate_exact_size(vec2(body.width(), content_h), Sense::click_and_drag());
+        let origin = crect.min;
+        let viewport_screen = vp.translate(origin.to_vec2());
+        background_clicks(ui, &bg, t, env);
+        let view_ref = &view;
+        let hit = |r: Rect| -> Vec<u32> {
+            let a = (r.top() / row_h).floor().max(0.0) as usize;
+            let b = ((r.bottom() / row_h).ceil() as usize).min(view_ref.len());
+            view_ref.get(a.min(b)..b).map(|s| s.to_vec()).unwrap_or_default()
+        };
+        rubber_band(ui, &bg, origin, viewport_screen, t, env, &hit);
+        let first = (vp.min.y / row_h).floor().max(0.0) as usize;
+        let last = ((vp.max.y / row_h).ceil() as usize + 1).min(view.len());
+        for (i, &idx) in view.iter().enumerate().take(last).skip(first) {
+            let r = Rect::from_min_size(origin + vec2(0.0, i as f32 * row_h), vec2(body.width(), row_h));
+            let e = t.entries[idx as usize].clone();
+            // Rows are known by path, in whichever column: the second click of a
+            // double-click lands on the row the first one made the tab's.
+            let resp = ui.interact(r, Id::new(("colrow", env.panel_id, &e.path)), Sense::click_and_drag());
+            let selected = t.selected.contains(&idx);
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &e.name));
+            let is_cursor = t.cursor == Some(idx);
+            if is_cursor {
+                t.cursor_screen_pos = Some(pos2(r.left() + 40.0, r.bottom()));
+            }
+            let drop = drop_target(ui, r, &e, env);
+            let faded = env.cut.contains(&e.path) || unmounted(t, &e) || dim_ignored && crate::gitstatus::ignored(git.as_deref(), &e.path, &t.path);
+            let editing = rename_focus(ui, r, idx, t, env);
+            paint_item_bg(ui.painter(), r.shrink2(vec2(2.0, 0.5)), selected && !editing, is_cursor && !editing, resp.hovered() && !editing, drop, env, 4);
+            crate::compare::paint(ui.painter(), r, &e.path, &pal);
+            handle_item(ui, &resp, idx, t, env);
+            let ic = Rect::from_min_size(pos2(r.left() + 6.0, r.center().y - 8.0), Vec2::splat(16.0));
+            let boxed = !computer && item_checkbox(ui, ic.shrink(1.0), idx, ui.rect_contains_pointer(r), t, env);
+            if computer {
+                paint_drive(ui, ic, t, &e, if faded { pal.text_dim.gamma_multiply(0.45) } else { pal.text_dim });
+            }
+            let name_r = Rect::from_min_max(pos2(ic.right() + 7.0, r.top()), pos2(r.right() - 8.0, r.bottom()));
+            if !rename_field(ui, name_r, idx, t, env, &font) {
+                column_cells(ui, r, ic, &e, env, q, selected && !editing, faded, !boxed && !computer, git.as_deref());
+            }
+        }
+    });
+    t.current_scroll = out.state.offset.y;
+}
+
+/// A column beside the tab's: an ancestor with the way on highlighted, or the folder
+/// under the cursor. A click here makes its folder the tab's, with what was clicked
+/// picked; a right-click does that and opens the menu; things dragged onto it land in it.
+fn side_column(ui: &mut Ui, cr: Rect, col: &mut Tab, child: Option<u32>, env: &mut Env) {
+    let row_h = row_height(env.cfg);
+    let body = cr.shrink2(vec2(4.0, 4.0));
+    let panel = env.panel_id;
+    let dir = col.path.clone();
+    let git = crate::gitstatus::repo_for(&dir);
+    let none = fuzzy::Query::new("");
+    let mut sa = egui::ScrollArea::vertical().id_salt(("colv", col.id)).auto_shrink([false, false]);
+    if let Some(s) = col.restore_scroll.take() {
+        sa = sa.vertical_scroll_offset(s);
+    }
+    let mut body_ui = ui.new_child(UiBuilder::new().max_rect(body));
+    let mut go: Option<(Option<PathBuf>, Option<Pos2>)> = None;
+    sa.show_viewport(&mut body_ui, |ui, vp| {
+        let n = col.view.len();
+        let content_h = (n as f32 * row_h).max(vp.height() - 1.0);
+        let (crect, bg) = ui.allocate_exact_size(vec2(body.width(), content_h), Sense::click());
+        let origin = crect.min;
+        if bg.clicked() {
+            go = Some((None, None));
+        }
+        if bg.secondary_clicked() {
+            go = Some((None, bg.interact_pointer_pos()));
+        }
+        let first = (vp.min.y / row_h).floor().max(0.0) as usize;
+        let last = ((vp.max.y / row_h).ceil() as usize + 1).min(n);
+        for i in first..last {
+            let idx = col.view[i];
+            let Some(e) = col.entries.get(idx as usize) else { continue };
+            let r = Rect::from_min_size(origin + vec2(0.0, i as f32 * row_h), vec2(body.width(), row_h));
+            let resp = ui.interact(r, Id::new(("colrow", panel, &e.path)), Sense::click_and_drag());
+            let on = child == Some(idx);
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, &e.name));
+            let drop = drop_target(ui, r, e, env);
+            // The way down is marked quieter than a selection: the picking happens in the
+            // tab's own column.
+            if on {
+                ui.painter().rect_filled(r.shrink2(vec2(2.0, 0.5)), CornerRadius::same(4), env.pal.panel.lerp_to_gamma(env.pal.selected, 0.6));
+            }
+            paint_item_bg(ui.painter(), r.shrink2(vec2(2.0, 0.5)), false, false, resp.hovered() && !on, drop, env, 4);
+            let ic = Rect::from_min_size(pos2(r.left() + 6.0, r.center().y - 8.0), Vec2::splat(16.0));
+            let faded = env.cut.contains(&e.path);
+            column_cells(ui, r, ic, e, env, &none, false, faded, true, git.as_deref());
+            if resp.clicked() {
+                LAST.store(Id::new(&e.path).value(), std::sync::atomic::Ordering::Relaxed);
+                // Open-on-single-click goes into a folder at once.
+                let into = env.cfg.single_click && e.is_dir && !ui.input(|i| i.modifiers.ctrl || i.modifiers.shift);
+                go = Some(if into { (None, None) } else { (Some(e.path.clone()), None) });
+                if into {
+                    let p = e.path.clone();
+                    env.actions.push(Action::Run(Box::new(move |app| crate::columns::focus(app, panel, p, None))));
+                    go = None;
+                }
+            }
+            if resp.secondary_clicked() {
+                go = Some((Some(e.path.clone()), resp.interact_pointer_pos()));
+            }
+            if resp.middle_clicked() && e.is_dir {
+                let path = e.path.clone();
+                env.actions.push(match env.cfg.middle_click {
+                    MiddleClick::OpenInSplit => Action::Split { panel, path, side: Side::Right, select: None },
+                    MiddleClick::OpenInNewTab => Action::NewTab { panel, path, select: None, focus: false },
+                });
+            }
+            let right = resp.drag_started_by(egui::PointerButton::Secondary);
+            if (resp.drag_started_by(egui::PointerButton::Primary) || right) && env.drag.is_none() {
+                *env.drag = Some(Drag::Files { paths: vec![e.path.clone()], from_panel: panel, right });
+            }
+        }
+        if col.scroll_to_cursor {
+            col.scroll_to_cursor = false;
+            if let Some(i) = child.and_then(|c| col.view.iter().position(|&x| x == c)) {
+                ui.scroll_to_rect(Rect::from_min_size(origin + vec2(0.0, i as f32 * row_h), vec2(body.width(), row_h)), None);
+            }
+        }
+    });
+    // Released over the column, not on a folder in it: into this column's folder.
+    if let Some(Drag::Files { paths, .. }) = env.drag.as_ref() {
+        let over = ui.ctx().pointer_latest_pos().is_some_and(|p| ui.clip_rect().contains(p));
+        if over && ui.input(|i| i.pointer.any_released()) {
+            if paths.iter().any(|p| p.parent() != Some(dir.as_path()) && *p != dir) {
+                let m = ui.input(|i| i.modifiers);
+                env.actions.push(Action::Drop { paths: paths.clone(), dest: dir.clone(), copy: m.ctrl && !m.shift, link: m.ctrl && m.shift });
+            }
+            *env.drag = None;
+        }
+    }
+    if let Some((item, menu)) = go {
+        env.actions.push(Action::Run(Box::new(move |app| {
+            crate::columns::focus(app, panel, dir, item);
+            if let Some(pos) = menu {
+                let background = app.panels.get(&panel).is_none_or(|p| p.tab().selected.is_empty());
+                app.popup = crate::ctxmenu::build(app, panel, pos, background);
+            }
+        })));
+    }
+    // Nothing to list: say why, small, in the column.
+    if col.view.is_empty() && !col.is_loading() {
+        let msg = match &col.error {
+            Some(e) => format!("Can't open: {}", fsx::plain_error(e)),
+            None if col.hidden_count > 0 => format!("{} hidden item{}", col.hidden_count, if col.hidden_count == 1 { "" } else { "s" }),
+            None => "Empty".into(),
+        };
+        let g = elided(ui, &msg, FontId::proportional(env.cfg.font_size - 1.0), (cr.width() - 24.0).max(30.0), env.pal.text_dim);
+        ui.painter().galley(pos2(cr.center().x - g.size().x / 2.0, cr.top() + row_height(env.cfg) * 1.5), g, env.pal.text_dim);
+    }
 }

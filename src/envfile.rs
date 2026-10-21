@@ -90,7 +90,7 @@ impl View {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn view(ui: &mut Ui, body: Rect, lines: &[String], v: &mut View, all: bool, numbers: bool, size: f32, pal: &Palette, spacing: f32) {
+pub fn view(ui: &mut Ui, body: Rect, lines: &[String], v: &mut View, all: bool, numbers: bool, size: f32, pal: &Palette, spacing: f32, sel: &mut Option<crate::textsel::Sel>) {
     let font = FontId::monospace(size);
     let row_h = crate::inspector::row_height(ui, size, spacing);
     let (line_h, cw) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, 'M')));
@@ -99,7 +99,28 @@ pub fn view(ui: &mut Ui, body: Rect, lines: &[String], v: &mut View, all: bool, 
     let mut inner = ui.new_child(UiBuilder::new().max_rect(body.shrink2(vec2(4.0, 4.0))));
     let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32 * cw + gutter + 20.0;
     egui::ScrollArea::both().auto_shrink([false, false]).id_salt("insp_env").show_viewport(&mut inner, |ui, vp| {
-        let (r, resp) = ui.allocate_exact_size(vec2(widest.max(vp.width()), lines.len() as f32 * row_h + 8.0), Sense::click());
+        let (r, resp) = ui.allocate_exact_size(vec2(widest.max(vp.width()), lines.len() as f32 * row_h + 8.0), Sense::click_and_drag());
+        // Selected as shown: a hidden value is its mask until it is revealed.
+        let text = |i: usize| lines.get(i).map_or(String::new(), |l| shown(l, v.kinds.get(i).copied().unwrap_or(Line::Hidden), all || v.open.contains(&i)));
+        if !lines.is_empty() {
+            let hit = |pp: egui::Pos2| -> crate::textsel::At {
+                let y = pp.y - r.top();
+                if y < 0.0 {
+                    return (0, 0);
+                }
+                let i = (y / row_h) as usize;
+                if i >= lines.len() {
+                    return (lines.len() - 1, text(lines.len() - 1).len());
+                }
+                (i, crate::textsel::byte_at_col(&text(i), (pp.x - r.left() - gutter) / cw.max(1.0)))
+            };
+            let word = |(i, b): crate::textsel::At| {
+                let (x, y) = crate::textsel::word(&text(i), b);
+                ((i, x), (i, y))
+            };
+            let line = |(i, _): crate::textsel::At| if i + 1 < lines.len() { ((i, 0), (i + 1, 0)) } else { ((i, 0), (i, text(i).len())) };
+            crate::textsel::track(ui, &resp, sel, hit, word, line);
+        }
         let first = (vp.min.y / row_h).floor().max(0.0) as usize;
         let last = ((vp.max.y / row_h).ceil() as usize + 1).min(lines.len());
         let p = ui.painter();
@@ -119,6 +140,15 @@ pub fn view(ui: &mut Ui, body: Rect, lines: &[String], v: &mut View, all: bool, 
             }
             if numbers {
                 p.text(pos2(r.left() + gutter - 10.0, y), Align2::RIGHT_TOP, (i + 1).to_string(), font.clone(), pal.text_dim.gamma_multiply(0.7));
+            }
+            if let Some((sa, sb, nl)) = sel.filter(|s| !s.is_empty()).and_then(|s| s.on_line(i, usize::MAX)) {
+                let t = shown(line, kind, reveal);
+                let (sa, sb) = (sa.min(t.len()), sb.min(t.len()));
+                let x0 = r.left() + gutter + crate::textsel::cols(&t, 0, sa) * cw;
+                let x1 = r.left() + gutter + crate::textsel::cols(&t, 0, sb) * cw + if nl { cw * 0.6 } else { 0.0 };
+                if x1 > x0 {
+                    crate::textsel::paint(p, Rect::from_min_max(pos2(x0, top), pos2(x1, top + row_h)), pal);
+                }
             }
             let mut job = LayoutJob::default();
             match kind {

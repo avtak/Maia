@@ -1,6 +1,6 @@
 //! What Maia changes in a work tree when asked: staging and unstaging files, hunks and
 //! lines, discarding, committing, branches and tags, checking out, cherry-picking,
-//! reverting and resetting to commits, and the stash. Everything runs on a worker,
+//! reverting and resetting to commits, merging a branch, and the stash. Everything runs on a worker,
 //! through `gitstatus::guard`, and nothing here ever pushes.
 //!
 //! Diffs come from the plumbing commands (`diff-files`, `diff-index`), which ignore the
@@ -527,6 +527,8 @@ pub enum Op {
     DeleteBranch { name: String, force: bool },
     RenameBranch { from: String, to: String },
     DeleteTag(String),
+    /// A branch (local or remote) merged into the one HEAD is on.
+    Merge(String),
 }
 
 impl Op {
@@ -535,7 +537,7 @@ impl Op {
         matches!(
             self,
             Op::Stage(_) | Op::StageAll | Op::Hunk { staged: false, .. } | Op::Lines { staged: false, .. } | Op::Discard(_) | Op::Switch(_) | Op::Track(_) | Op::StashApply(_) | Op::StashPop(_) | Op::Pull(_) | Op::Continue | Op::Abort | Op::Skip
-                | Op::Checkout(_) | Op::Branch { switch: true, .. } | Op::CherryPick { .. } | Op::Revert { .. } | Op::Reset { hard: true, .. }
+                | Op::Checkout(_) | Op::Branch { switch: true, .. } | Op::CherryPick { .. } | Op::Revert { .. } | Op::Reset { hard: true, .. } | Op::Merge(_)
         )
     }
 
@@ -816,6 +818,7 @@ pub fn run(root: &Path, op: &Op) -> Result<String, String> {
             exec(root, &["branch", "-m", from, to], None, quick).map(|_| format!("Renamed {from} to {to}"))
         }
         Op::DeleteTag(t) => exec(root, &["tag", "-d", t], None, quick).map(|out| format!("Deleted the tag {t} · it was at {}", was(&out))),
+        Op::Merge(b) => crate::gitsync::merge(root, b),
     }
 }
 
@@ -839,6 +842,7 @@ pub fn start(ctx: &egui::Context, root: &Path, op: Op, title: String) {
         Op::Fetch => Some("Fetching…"),
         Op::Pull(_) => Some("Pulling…"),
         Op::Push(_) => Some("Pushing…"),
+        Op::Merge(_) => Some("Merging…"),
         _ => None,
     };
     let slot = crate::gitlog::spawn(ctx, move || {

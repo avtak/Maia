@@ -196,6 +196,28 @@ pub struct Inspector {
     pub edit: Option<Box<crate::quickedit::Edit>>,
     /// The picture shown, playing, when it moves.
     anim: Option<crate::anim::Player>,
+    /// Text selected in a text preview (lines as shown, filtered or not), and what it
+    /// was made on: (text, the filter it went through).
+    tsel: Option<crate::textsel::Sel>,
+    tsel_for: (u64, String),
+    /// The view drawn last, for Ctrl+C and Ctrl+A.
+    showing: Showing,
+    /// A copy out of a big file, being read on a worker.
+    copying: Option<std::sync::mpsc::Receiver<(String, bool)>>,
+}
+
+/// Which view of the content was drawn last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Showing {
+    Other,
+    /// Lines as text; whether through the log's filter.
+    Text(bool),
+    Env,
+    Markdown,
+    Tree,
+    Table,
+    Sqlite,
+    Big,
 }
 
 /// Test-only views of the preview state (simulations check behaviour, not pixels).
@@ -421,6 +443,144 @@ impl Inspector {
     }
 }
 
+impl Inspector {
+    /// Something is selected in the view shown.
+    pub fn has_selection(&self) -> bool {
+        use crate::textsel::some;
+        match (self.showing, &self.content) {
+            (Showing::Text(_) | Showing::Env, Content::Text { .. }) => some(&self.tsel),
+            (Showing::Markdown, Content::Text { rich: Some(r), .. }) => matches!(&**r, Rich::Markdown(v) | Rich::Book(v) if some(&v.sel)),
+            (Showing::Tree, Content::Text { rich: Some(r), .. }) => matches!(&**r, Rich::Data(t) if some(&t.tsel)),
+            (Showing::Table, Content::Text { rich: Some(r), .. }) => matches!(&**r, Rich::Table(t) if t.sel.is_some()),
+            (Showing::Sqlite, Content::Sqlite(v)) => matches!(&v.rows, Some((_, Ok(t))) if t.sel.is_some()),
+            (Showing::Big, Content::Big(v)) => if v.hex { v.hsel.is_some() } else { some(&v.sel) },
+            _ => false,
+        }
+    }
+
+    /// Ctrl+A: all of the view shown. False when it has nothing to select.
+    pub fn select_all(&mut self) -> bool {
+        use crate::textsel::{END, Sel};
+        match (self.showing, &mut self.content) {
+            (Showing::Text(_) | Showing::Env, Content::Text { .. }) => {
+                self.tsel = Some(Sel::new((0, 0), END));
+                true
+            }
+            (Showing::Markdown | Showing::Tree | Showing::Table, Content::Text { rich: Some(r), .. }) => match &mut **r {
+                Rich::Markdown(v) | Rich::Book(v) => {
+                    v.sel = Some(Sel::new((0, 0), END));
+                    true
+                }
+                Rich::Data(t) => {
+                    t.tsel = Some(Sel::new((0, 0), END));
+                    true
+                }
+                Rich::Table(t) => t.select_all(),
+                _ => false,
+            },
+            (Showing::Sqlite, Content::Sqlite(v)) => match &mut v.rows {
+                Some((_, Ok(t))) => t.select_all(),
+                _ => false,
+            },
+            (Showing::Big, Content::Big(v)) => {
+                if v.hex {
+                    v.hsel = (v.size > 0).then(|| (Sel::new(0, v.size - 1), false));
+                } else {
+                    v.sel = Some(Sel::new((0, 0), END));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The selection's text for the clipboard. A big file's is read on a worker and
+    /// lands later.
+    pub fn copy_selection(&mut self, ctx: &egui::Context) -> crate::textsel::Copied {
+        use crate::textsel::{Copied, lines_text};
+        use std::borrow::Cow;
+        let sel = self.tsel.filter(|s| !s.is_empty());
+        let text = match (self.showing, &mut self.content) {
+            (Showing::Text(filtered), Content::Text { lines, .. }) => {
+                let Some(s) = sel else { return Copied::Nothing };
+                let shown: &[String] = match &self.filtered {
+                    Some(f) if filtered => &f.3,
+                    _ => lines,
+                };
+                lines_text(&s, shown.len(), |i| shown.get(i).map(|l| Cow::Borrowed(l.as_str())))
+            }
+            (Showing::Env, Content::Text { lines, rich: Some(r), .. }) => {
+                let (Some(s), Rich::Env(v)) = (sel, &**r) else { return Copied::Nothing };
+                // Copied as shown: a value still hidden stays hidden.
+                lines_text(&s, lines.len(), |i| lines.get(i).map(|l| Cow::Owned(crate::envfile::shown(l, v.kinds.get(i).copied().unwrap_or(crate::envfile::Line::Hidden), self.env_all || v.open.contains(&i)))))
+            }
+            (Showing::Markdown | Showing::Tree | Showing::Table, Content::Text { rich: Some(r), .. }) => match &**r {
+                Rich::Markdown(v) | Rich::Book(v) => v.copy_text(),
+                Rich::Data(t) => t.copy_text(),
+                Rich::Table(t) => t.copy_text(),
+                _ => String::new(),
+            },
+            (Showing::Sqlite, Content::Sqlite(v)) => match &v.rows {
+                Some((_, Ok(t))) => t.copy_text(),
+                _ => String::new(),
+            },
+            (Showing::Big, Content::Big(v)) => {
+                let rx = if v.hex { v.hsel.map(|(s, text)| v.copy_bytes(s, text, ctx)) } else { v.sel.filter(|s| !s.is_empty()).map(|s| v.copy_lines(s, ctx)) };
+                let Some(rx) = rx else { return Copied::Nothing };
+                self.copying = Some(rx);
+                return Copied::Later;
+            }
+            _ => String::new(),
+        };
+        if text.is_empty() { Copied::Nothing } else { Copied::Now(text) }
+    }
+
+    /// A copy read on a worker, once it is: onto the clipboard, and said.
+    fn pump_copy(&mut self, ctx: &egui::Context, actions: &mut Vec<crate::app::Action>) {
+        let Some(rx) = &self.copying else { return };
+        match rx.try_recv() {
+            Ok((text, cut)) => {
+                self.copying = None;
+                if text.is_empty() {
+                    return;
+                }
+                let say = if cut { format!("Copied the first {}", fsx::fmt_size(text.len() as u64)) } else { crate::textsel::said(&text) };
+                ctx.copy_text(text);
+                actions.push(crate::app::Action::Toast(say));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.copying = None,
+            Err(_) => {}
+        }
+    }
+
+    /// The selected text of a text preview, for tests: (from, to), in order.
+    #[cfg(test)]
+    pub fn text_selection(&self) -> Option<(crate::textsel::At, crate::textsel::At)> {
+        self.tsel.filter(|s| !s.is_empty()).map(|s| s.span())
+    }
+
+    #[cfg(test)]
+    pub fn big_selection(&self) -> Option<(crate::textsel::At, crate::textsel::At)> {
+        match &self.content {
+            Content::Big(v) => v.sel.filter(|s| !s.is_empty()).map(|s| s.span()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn hex_selection(&self) -> Option<((u64, u64), bool)> {
+        match &self.content {
+            Content::Big(v) => v.hsel.map(|(s, t)| (s.span(), t)),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn copying(&self) -> bool {
+        self.copying.is_some()
+    }
+}
+
 impl Default for Inspector {
     fn default() -> Self {
         Inspector {
@@ -467,6 +627,10 @@ impl Default for Inspector {
             keys: false,
             edit: None,
             anim: None,
+            tsel: None,
+            tsel_for: (0, String::new()),
+            showing: Showing::Other,
+            copying: None,
         }
     }
 }
@@ -476,6 +640,7 @@ impl Inspector {
     /// few hundred thousand strings is a stall a frame should not wait for.
     fn set(&mut self, c: Content) {
         self.paged_log = false;
+        self.tsel = None;
         let old = std::mem::replace(&mut self.content, c);
         if let Content::Text { lines, rich, spans, .. } = old {
             if lines.len() > 2000 || rich.is_some() {
@@ -511,6 +676,8 @@ impl Inspector {
         self.pending = None;
         self.git = Some(Box::new(h));
         self.compare = None;
+        // Just opened, it has the keyboard: Ctrl+F searches it.
+        self.keys = true;
     }
 
     /// Start showing `e`. Anything that touches the disk (folder listings, file contents)
@@ -544,6 +711,21 @@ impl Inspector {
                 }
                 return;
             }
+        }
+        // A lone compressed file (notes.txt.gz) previews as the file in it.
+        if !e.is_dir && e.size <= 16 << 20 && crate::archive::is_archive(&e.name) && crate::archive::single(&e.path) {
+            self.set(Content::Other);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (archive, ctx) = (e.path.clone(), ctx.clone());
+            let mut inner = e.clone();
+            inner.name = crate::archive::stem(&e.name).to_string();
+            let name = inner.name.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::archive::extract_for_open(&archive, Path::new(&name)));
+                ctx.request_repaint();
+            });
+            self.extracting = Some((rx, inner));
+            return;
         }
         if e.special {
             // Sockets, FIFOs and device nodes: opening or reading them can block forever.
@@ -931,6 +1113,17 @@ pub fn inspector(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
     if let Some(h) = ins.git.as_mut() {
         // The changes follow the status marks; a branch switched elsewhere shows.
         h.follow(crate::gitstatus::repo_for(&here).as_ref(), ui.ctx());
+        // A search starts in the folder shown; Ctrl+F is the history's once it is clicked.
+        if let Ok(rel) = here.strip_prefix(&h.root) {
+            if Path::new(&h.here) != rel {
+                h.here = rel.to_string_lossy().into_owned();
+            }
+        }
+        if ui.input(|i| i.pointer.any_pressed()) {
+            if let Some(pp) = ui.ctx().pointer_interact_pos() {
+                ins.keys = rect.contains(pp);
+            }
+        }
         // Leaving the work tree closes its history. Diffs wrap as code previews do.
         if !here.starts_with(&h.root) || !crate::gitlog::view(ui, rect, h, &mut ins.wrap_code, env) {
             close_history(panel);
@@ -1269,6 +1462,9 @@ pub fn inspector(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
     }
     let mut bui = ui.new_child(UiBuilder::new().max_rect(body).id_salt(("insp", env.panel_id)));
     bui.set_clip_rect(body.intersect(ui.clip_rect()));
+    ins.showing = Showing::Other;
+    ins.pump_copy(ui.ctx(), &mut env.actions);
+    crate::textsel::forget_painted();
     let Some(e) = target else {
         bui.painter().text(body.center(), Align2::CENTER_CENTER, "Nothing to preview", FontId::proportional(env.cfg.font_size), pal.text_dim);
         return;
@@ -1295,10 +1491,8 @@ pub fn inspector(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
             bui.painter().text(body.center(), Align2::CENTER_CENTER, "Preparing preview…", FontId::proportional(12.5), pal.text_dim);
             return;
         }
-        Content::Media(v) => {
-            media_view(&mut bui, body, &e, v, env);
-            return;
-        }
+        // Drawn, then the Details card over it as for a picture: its length, size and codecs.
+        Content::Media(v) => media_view(&mut bui, body, &e, v, env),
         Content::Font(v) => {
             font_view(&mut bui, body, v, env);
             return;
@@ -1319,6 +1513,13 @@ pub fn inspector(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
     }
     if matches!(ins.content, Content::Big(_)) {
         big_body(&mut bui, body, ins, &e, env);
+    }
+    // A right-click on what is selected offers to copy it.
+    if let Some(pp) = ui.input(|i| i.pointer.interact_pos().filter(|_| i.pointer.button_clicked(egui::PointerButton::Secondary))) {
+        if body.contains(pp) && crate::textsel::on_painted(pp) && ins.has_selection() {
+            ins.keys = true;
+            env.actions.push(crate::app::Action::Open(crate::ctxmenu::build_preview(env.panel_id, pp)));
+        }
     }
     match &ins.content {
         Content::Pdf(_) | Content::Office(_) | Content::Media(_) | Content::Font(_) | Content::Text { .. } | Content::Sqlite(_) | Content::Big(_) => {}
@@ -1391,6 +1592,10 @@ pub fn inspector(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
                 });
                 ui.add_space(4.0);
                 let extra = ins.extra_meta;
+                let probe = match &ins.content {
+                    Content::Media(v) => v.probe.clone(),
+                    _ => None,
+                };
                 egui::Grid::new(("metagrid", env.panel_id)).num_columns(2).spacing(vec2(14.0, 3.0)).show(ui, |ui| {
                     let mut row = |k: &str, v: String| {
                         ui.label(egui::RichText::new(k).color(pal.text_dim).size(11.5));
@@ -1431,6 +1636,19 @@ pub fn inspector(ui: &mut Ui, rect: Rect, panel: &mut Panel, env: &mut Env) {
                                 let mp = l.dims[0] as f64 * l.dims[1] as f64 / 1e6;
                                 row("Megapixels", format!("{mp:.2}"));
                             }
+                        }
+                    }
+                    if let Some(p) = &probe {
+                        if p.duration > 0.0 {
+                            row("Duration", crate::media::fmt_time(p.duration));
+                        }
+                        match p.video {
+                            Some(d) => {
+                                row("Resolution", crate::facts::fmt_dims(d));
+                                row("Codecs", [p.codec.as_str(), p.acodec.as_str()].iter().filter(|c| !c.is_empty()).copied().collect::<Vec<_>>().join(", "));
+                            }
+                            None if !p.codec.is_empty() => row("Codec", p.codec.clone()),
+                            None => {}
                         }
                     }
                     if let Some([y, mo, d, h, mi, _]) = exif.as_ref().and_then(|x| x.taken) {
@@ -1545,6 +1763,7 @@ fn text_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut 
     let spacing = env.cfg.preview_line_spacing;
     let id = env.panel_id;
     if let Content::Sqlite(v) = &mut ins.content {
+        ins.showing = Showing::Sqlite;
         crate::sqlite::view(ui, body, v, size, &pal, spacing, id);
         return None;
     }
@@ -1572,6 +1791,7 @@ fn text_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut 
     if !source {
         match rich.as_deref_mut() {
             Some(Rich::Markdown(v) | Rich::Book(v)) => {
+                ins.showing = Showing::Markdown;
                 match crate::markdown::view(ui, body, v, size, &pal, spacing, env.thumbs, id) {
                     Some(crate::markdown::Follow::Open(p)) => env.actions.push(crate::app::Action::OpenFile(p)),
                     Some(crate::markdown::Follow::Folder(p)) => env.actions.push(crate::app::Action::Navigate { panel: id, path: p }),
@@ -1585,12 +1805,14 @@ fn text_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut 
                 return None;
             }
             Some(Rich::Data(t)) => {
+                ins.showing = Showing::Tree;
                 if let Some(path) = crate::datatree::view(ui, body, t, size, &pal, spacing, id) {
                     env.actions.push(crate::app::Action::Toast(format!("Copied {path}")));
                 }
                 return None;
             }
             Some(Rich::Table(t)) => {
+                ins.showing = Showing::Table;
                 crate::table::view(ui, body, t, size, &pal, spacing, id);
                 return None;
             }
@@ -1598,7 +1820,8 @@ fn text_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut 
         }
     }
     if let Some(Rich::Env(v)) = rich.as_deref_mut() {
-        crate::envfile::view(ui, body, lines, v, ins.env_all, ins.line_numbers, size, &pal, spacing);
+        ins.showing = Showing::Env;
+        crate::envfile::view(ui, body, lines, v, ins.env_all, ins.line_numbers, size, &pal, spacing, &mut ins.tsel);
         return None;
     }
     // A data file that would not parse says why, above its text.
@@ -1645,6 +1868,14 @@ fn text_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut 
         }
     }
     let filtered = !std::ptr::eq(shown, lines.as_slice());
+    // A selection belongs to the lines it was made on: another text, or another filter,
+    // starts without one.
+    let made_on = (ins.era, if filtered { ins.filter.trim().to_string() } else { String::new() });
+    if ins.tsel_for != made_on {
+        ins.tsel = None;
+        ins.tsel_for = made_on;
+    }
+    ins.showing = Showing::Text(filtered);
     // The blame of this file (one left from another file says nothing here).
     let job = ins.blame.as_ref().filter(|b| ins.blame_on && !filtered && b.key.0 == e.path);
     let blame = job.map(|b| match &b.got {
@@ -1669,7 +1900,7 @@ fn text_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut 
         }
         _ => None,
     };
-    let opts = TextOpts { blame, first: if filtered { 0 } else { ins.first_line }, stick: ins.follow, to_end: std::mem::take(&mut ins.to_end), mark, hits, reveal, ..Default::default() };
+    let opts = TextOpts { blame, first: if filtered { 0 } else { ins.first_line }, stick: ins.follow, to_end: std::mem::take(&mut ins.to_end), mark, hits, reveal, sel: Some(&mut ins.tsel), ..Default::default() };
     let spans = if filtered { None } else { spans.as_deref() };
     text_view_ex(ui, body, shown, *truncated && !filtered, spans, ins.line_numbers, wrapped, size, &pal, is_patch(&e.name), spacing, opts)
 }
@@ -1783,6 +2014,7 @@ fn big_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut E
     let pal = *env.pal;
     let (size, spacing, id) = (env.cfg.inspector_font_size + ins.text_size, env.cfg.preview_line_spacing, env.panel_id);
     let Content::Big(v) = &mut ins.content else { return };
+    ins.showing = Showing::Big;
     let mut body = body;
     // The match to scroll to: a line, or a byte offset in hex.
     let mut target = None;
@@ -1850,9 +2082,11 @@ fn big_body(ui: &mut Ui, body: Rect, ins: &mut Inspector, e: &Entry, env: &mut E
             pending = None;
         }
         let mut seen = v.seen;
-        let opts = TextOpts { window: Some((rows as usize, first as usize, v.estimate() as usize)), hits: query.map(|_| (&hits[..], cur_hit)), reveal, seen: Some(&mut seen), ..Default::default() };
+        let mut sel = v.sel;
+        let opts = TextOpts { window: Some((rows as usize, first as usize, v.estimate() as usize)), hits: query.map(|_| (&hits[..], cur_hit)), reveal, seen: Some(&mut seen), sel: Some(&mut sel), ..Default::default() };
         let spans = v.spans.as_ref().map(|s| &s.2[..]);
         text_view_ex(ui, body, lines, false, spans, ins.line_numbers, None, size, &pal, false, spacing, opts);
+        v.sel = sel;
         v.reveal = pending;
         if seen != v.seen {
             v.seen = seen;
@@ -1905,8 +2139,36 @@ fn hex_view(ui: &mut Ui, body: Rect, v: &mut crate::bigfile::Pager, size: f32, s
         }
     }
     let mut seen = v.seen;
+    let mut hsel = v.hsel;
     area.show_viewport(&mut inner, |ui, vp| {
-        let (r, resp) = ui.allocate_exact_size(vec2((x_txt + bpr as f32 * cw + 8.0).max(vp.width()), rows as f32 * row_h + 8.0), Sense::hover());
+        let (r, resp) = ui.allocate_exact_size(vec2((x_txt + bpr as f32 * cw + 8.0).max(vp.width()), rows as f32 * row_h + 8.0), Sense::click_and_drag());
+        // Bytes under the mouse, both ends taken: a press picks one (in the column it is
+        // in), Shift or a drag stretches to another, a triple-click takes its row.
+        if v.size > 0 {
+            let at = |pp: Pos2| -> (u64, bool) {
+                let row = ((pp.y - r.top()) / row_h).max(0.0) as u64;
+                let x = pp.x - r.left();
+                let text = x >= x_txt - cw * 0.5;
+                let col = if text { ((x - x_txt) / cw).max(0.0) as usize } else { (0..bpr).rev().find(|&i| x >= x_of(i) - cw * 0.5).unwrap_or(0) };
+                ((row * v.bpr + col.min(bpr - 1) as u64).min(v.size - 1), text)
+            };
+            let (pressed, down, shift, origin, pos) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.shift, i.pointer.press_origin(), i.pointer.interact_pos()));
+            let on = resp.is_pointer_button_down_on();
+            if let Some(o) = origin.filter(|_| pressed && on) {
+                let (o, text) = at(o);
+                match hsel.as_mut() {
+                    Some((s, _)) if shift => s.head = o,
+                    _ => hsel = Some((crate::textsel::Sel::at(o), text)),
+                }
+            } else if let (true, true, Some(pp), Some((s, _))) = (on, down, pos, hsel.as_mut()) {
+                s.head = at(pp).0;
+                crate::textsel::autoscroll(ui, pp);
+            }
+            if let (true, Some(pp), Some((s, _))) = (resp.triple_clicked(), pos, hsel.as_mut()) {
+                let row = at(pp).0 / v.bpr * v.bpr;
+                *s = crate::textsel::Sel::new(row, (row + v.bpr - 1).min(v.size - 1));
+            }
+        }
         let first = (vp.min.y / row_h).floor().max(0.0) as usize;
         let last = ((vp.max.y / row_h).ceil() as usize + 1).min(rows as usize);
         seen = (first, last);
@@ -1934,6 +2196,19 @@ fn hex_view(ui: &mut Ui, body: Rect, v: &mut crate::bigfile::Pager, size: f32, s
                 p.text(pos2(r.left() + x_hex, y), Align2::LEFT_TOP, "·", font.clone(), pal.text_dim.gamma_multiply(0.5));
                 continue;
             };
+            // The selection: full in the column it was made in (the one Copy takes),
+            // faint in the other.
+            if let Some(((lo, hi), text)) = hsel.map(|(s, t)| (s.span(), t)).filter(|_| !bytes.is_empty()) {
+                let (a, b) = (lo.max(off), hi.min(off + bytes.len() as u64 - 1));
+                if a <= b {
+                    let (i0, i1) = ((a - off) as usize, (b - off) as usize);
+                    let hex_r = Rect::from_min_max(pos2(r.left() + x_of(i0) - cw * 0.5, top), pos2(r.left() + x_of(i1) + cw * 2.5, top + row_h));
+                    let txt_r = Rect::from_min_max(pos2(r.left() + x_txt + i0 as f32 * cw, top), pos2(r.left() + x_txt + (i1 + 1) as f32 * cw, top + row_h));
+                    let (main, other) = if text { (txt_r, hex_r) } else { (hex_r, txt_r) };
+                    crate::textsel::paint(p, main, pal);
+                    p.rect_filled(other, CornerRadius::ZERO, pal.selected.gamma_multiply(0.4));
+                }
+            }
             for i in 0..bytes.len() {
                 let o = off + i as u64;
                 let k = found.partition_point(|&s| s + n <= o);
@@ -1970,6 +2245,7 @@ fn hex_view(ui: &mut Ui, body: Rect, v: &mut crate::bigfile::Pager, size: f32, s
             }
         }
     });
+    v.hsel = hsel;
     if seen != v.seen {
         v.seen = seen;
         v.want(seen.0 as u64, seen.1 as u64 + 1);
@@ -2518,11 +2794,13 @@ pub(crate) struct TextOpts<'a> {
     /// A diff whose changed lines can be picked: those picked, and where the one
     /// clicked this frame goes (with whether Shift was held).
     pub pick: Option<(&'a [bool], &'a mut Option<(usize, bool)>)>,
+    /// Text can be selected: what is, by line (counted as `window`'s are) and byte.
+    pub sel: Option<&'a mut Option<crate::textsel::Sel>>,
 }
 
 impl Default for TextOpts<'_> {
     fn default() -> Self {
-        TextOpts { blame: None, first: 1, stick: false, to_end: false, mark: None, window: None, hits: None, reveal: None, seen: None, pick: None }
+        TextOpts { blame: None, first: 1, stick: false, to_end: false, mark: None, window: None, hits: None, reveal: None, seen: None, pick: None, sel: None }
     }
 }
 
@@ -2600,9 +2878,51 @@ pub(crate) fn text_view_ex(ui: &mut Ui, body: Rect, lines: &[String], truncated:
     let now = crate::blame::now();
     let mut pick = opts.pick;
     let picked: &[bool] = pick.as_ref().map_or(&[], |p| p.0);
+    let mut sel = opts.sel;
+    // This row's line and the bytes of it shown.
+    let row_of = |i: usize| -> (usize, usize, usize) {
+        match rows {
+            Some(rows) => {
+                let (li, a) = (rows[i].0 as usize, rows[i].1 as usize);
+                (li, a, rows.get(i + 1).filter(|n| n.0 as usize == li).map_or(usize::MAX, |n| n.1 as usize))
+            }
+            None => (i, 0, usize::MAX),
+        }
+    };
+    let line_of = |li: usize| li.checked_sub(off).and_then(|k| lines.get(k));
     area.auto_shrink([false, false]).stick_to_bottom(opts.stick).id_salt("insp_text").show_viewport(&mut inner, |ui, vp| {
         let w = if rows.is_some() { vp.width() } else { (2000.0 * size * 0.62).min(lines.iter().map(|l| l.len()).max().unwrap_or(0) as f32 * size * 0.62 + gutter + 20.0).max(vp.width()) };
-        let (r, resp) = ui.allocate_exact_size(vec2(w, n as f32 * row_h + 8.0), if pick.is_some() { Sense::click() } else { Sense::hover() });
+        let sense = if pick.is_some() { Sense::click() } else if sel.is_some() { Sense::click_and_drag() } else { Sense::hover() };
+        let (r, resp) = ui.allocate_exact_size(vec2(w, n as f32 * row_h + 8.0), sense);
+        if let Some(sel) = sel.as_deref_mut().filter(|_| total > 0) {
+            // The place under a point: its row, then the column in it, past the gutter.
+            let hit = |pp: Pos2| -> crate::textsel::At {
+                let y = pp.y - r.top();
+                if y < 0.0 {
+                    let (li, a, _) = row_of(0);
+                    return (li, a);
+                }
+                let i = (y / row_h) as usize;
+                if i >= total {
+                    let (li, ..) = row_of(total - 1);
+                    return (li, line_of(li).map_or(0, |l| l.len()));
+                }
+                let (li, a, b) = row_of(i);
+                let Some(l) = line_of(li) else { return (li, 0) };
+                let b = b.min(l.len());
+                let part = l.get(a..b).unwrap_or("");
+                (li, a + crate::textsel::byte_at_col(part, (pp.x - r.left() - gutter) / cw.max(1.0)))
+            };
+            let word = |(li, b): crate::textsel::At| {
+                let (x, y) = line_of(li).map_or((0, 0), |l| crate::textsel::word(l, b));
+                ((li, x), (li, y))
+            };
+            let line = |(li, _): crate::textsel::At| {
+                if li + 1 < all { ((li, 0), (li + 1, 0)) } else { ((li, 0), (li, line_of(li).map_or(0, |l| l.len()))) }
+            };
+            crate::textsel::track(ui, &resp, sel, hit, word, line);
+        }
+        let sel = sel.as_deref().copied().flatten().filter(|s| !s.is_empty());
         // The changed line under the pointer, when lines can be picked: a click picks it.
         let hover_line = resp.hover_pos().filter(|_| pick.is_some()).map(|hp| ((hp.y - r.top()).max(0.0) / row_h) as usize).filter(|&i| i < total).map(|i| rows.map_or(i, |rw| rw[i].0 as usize)).filter(|&li| matches!(lines[li].as_bytes().first(), Some(b'+' | b'-')));
         if let (Some(li), Some((_, slot))) = (hover_line, pick.as_mut()) {
@@ -2641,15 +2961,8 @@ pub(crate) fn text_view_ex(ui: &mut Ui, body: Rect, lines: &[String], truncated:
                 p.text(pos2(r.left() + gutter, y), Align2::LEFT_TOP, "… (preview truncated at 1 MB)", font.clone(), pal.text_dim);
                 continue;
             }
-            // This row's line and the part of it shown.
-            let (li, a, b) = match rows {
-                Some(rows) => {
-                    let (li, a) = (rows[i].0 as usize, rows[i].1 as usize);
-                    (li, a, rows.get(i + 1).filter(|n| n.0 as usize == li).map_or(usize::MAX, |n| n.1 as usize))
-                }
-                None => (i, 0, usize::MAX),
-            };
-            let Some(line) = li.checked_sub(off).and_then(|k| lines.get(k)) else {
+            let (li, a, b) = row_of(i);
+            let Some(line) = line_of(li) else {
                 p.text(pos2(r.left() + gutter, y), Align2::LEFT_TOP, "·", font.clone(), pal.text_dim.gamma_multiply(0.5));
                 continue;
             };
@@ -2699,6 +3012,19 @@ pub(crate) fn text_view_ex(ui: &mut Ui, body: Rect, lines: &[String], truncated:
             };
             if tint != Color32::TRANSPARENT {
                 p.rect_filled(Rect::from_min_size(pos2(r.left(), top), vec2(r.width(), row_h)), CornerRadius::ZERO, tint.gamma_multiply(if pal.dark { 0.13 } else { 0.11 }));
+            }
+            // The selection behind the text; a selected line break as a sliver past
+            // the line's end.
+            if let Some((sa, sb, nl)) = sel.and_then(|s| s.on_line(li, line.len())) {
+                let (sa, sb) = (sa.max(a), sb.min(b));
+                let tail = if nl && b == line.len() { cw * 0.6 } else { 0.0 };
+                if sa <= sb {
+                    let x0 = r.left() + gutter + crate::textsel::cols(line, a, sa) * cw;
+                    let x1 = r.left() + gutter + crate::textsel::cols(line, a, sb) * cw + tail;
+                    if x1 > x0 {
+                        crate::textsel::paint(p, Rect::from_min_max(pos2(x0, top), pos2(x1, top + row_h)), pal);
+                    }
+                }
             }
             if let Some((hits, cur)) = opts.hits {
                 // The current match's line, faintly, to find it by at a glance.

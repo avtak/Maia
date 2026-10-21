@@ -3,7 +3,8 @@
 //!
 //! Commands (coordinates in logical points, relative to the window):
 //!   move X Y            click X Y [left|right|middle] [ctrl|shift|alt...]
-//!   dclick X Y          drag X1 Y1 X2 Y2 [left|right]
+//!   dclick X Y          drag X1 Y1 X2 Y2 [left|right] [ctrl|shift|alt...]
+//!   tclick X Y          hold [ctrl|shift|alt...|none]   (held between events too)
 //!   key COMBO           e.g. `key ctrl+shift+p`, `key enter`, `key alt+up`
 //!   text STRING         scroll X Y DY
 //!   wait N              idle N frames
@@ -108,6 +109,16 @@ impl Driver {
     }
 }
 
+thread_local! {
+    static HELD: std::cell::Cell<Modifiers> = const { std::cell::Cell::new(Modifiers::NONE) };
+}
+
+/// The modifiers `hold` keeps down while no event says otherwise (a pointer resting with
+/// Ctrl held).
+pub(crate) fn held() -> Modifiers {
+    HELD.with(|h| h.get())
+}
+
 fn mods_of(words: &[&str]) -> Modifiers {
     let mut m = Modifiers::NONE;
     for w in words {
@@ -146,12 +157,20 @@ pub(crate) fn parse(line: &str) -> Vec<Vec<Event>> {
             let p = pos2(num(1), num(2));
             vec![vec![Event::PointerMoved(p)], vec![press(p, button(w.get(3)), Modifiers::NONE, w[0] == "down")]]
         }
-        Some("click") | Some("dclick") => {
+        Some("hold") => {
+            HELD.with(|h| h.set(mods_of(&w[1..])));
+            vec![vec![]]
+        }
+        Some("click") | Some("dclick") | Some("tclick") => {
             let p = pos2(num(1), num(2));
             let b = button(w.get(3));
             let m = mods_of(&w[3.min(w.len())..]);
             let mut steps = vec![vec![Event::PointerMoved(p)], vec![press(p, b, m, true)], vec![press(p, b, m, false)]];
-            if w[0] == "dclick" {
+            for _ in 0..match w[0] {
+                "dclick" => 1,
+                "tclick" => 2,
+                _ => 0,
+            } {
                 steps.push(vec![press(p, b, m, true)]);
                 steps.push(vec![press(p, b, m, false)]);
             }
@@ -160,12 +179,13 @@ pub(crate) fn parse(line: &str) -> Vec<Vec<Event>> {
         Some("drag") => {
             let (a, z) = (pos2(num(1), num(2)), pos2(num(3), num(4)));
             let b = button(w.get(5));
-            let mut steps = vec![vec![Event::PointerMoved(a)], vec![press(a, b, Modifiers::NONE, true)]];
+            let m = mods_of(&w[5.min(w.len())..]);
+            let mut steps = vec![vec![Event::PointerMoved(a)], vec![press(a, b, m, true)]];
             for k in 1..=12 {
                 let t = k as f32 / 12.0;
                 steps.push(vec![Event::PointerMoved(a + (z - a) * t)]);
             }
-            steps.push(vec![press(z, b, Modifiers::NONE, false)]);
+            steps.push(vec![press(z, b, m, false)]);
             steps
         }
         // scroll X Y DY [ctrl]: DY in wheel lines (1 = one notch).

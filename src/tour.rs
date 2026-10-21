@@ -20,7 +20,7 @@ use crate::popups::{self as pp, Opt, Popup};
 use crate::theme::{Palette, ThemeName};
 
 /// The version What's New describes. A start that has seen an older one shows it.
-pub const NEWS_VERSION: &str = "0.4.0";
+pub const NEWS_VERSION: &str = "0.5.0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -52,11 +52,11 @@ const PALETTE: &[u8] = include_bytes!("../assets/tour/palette.webp");
 const SPLIT: &[u8] = include_bytes!("../assets/tour/split.webp");
 const PREVIEW: &[u8] = include_bytes!("../assets/tour/preview.webp");
 const GIT: &[u8] = include_bytes!("../assets/tour/git.webp");
-const FIND: &[u8] = include_bytes!("../assets/tour/find.webp");
-const EDIT: &[u8] = include_bytes!("../assets/tour/edit.webp");
-const TERMINAL: &[u8] = include_bytes!("../assets/tour/terminal.webp");
-const SYNC: &[u8] = include_bytes!("../assets/tour/sync.webp");
-const UNLOCK: &[u8] = include_bytes!("../assets/tour/unlock.webp");
+const PICKER: &[u8] = include_bytes!("../assets/tour/picker.webp");
+const COLUMNS: &[u8] = include_bytes!("../assets/tour/columns.webp");
+const FILTER: &[u8] = include_bytes!("../assets/tour/filter.webp");
+const GITSEARCH: &[u8] = include_bytes!("../assets/tour/gitsearch.webp");
+const SORTING: &[u8] = include_bytes!("../assets/tour/sorting.webp");
 
 pub const WELCOME: &[Page] = &[
     Page {
@@ -99,67 +99,66 @@ pub const WELCOME: &[Page] = &[
 
 pub const NEWS: &[Page] = &[
     Page {
-        title: "Find in any preview",
-        text: "Find marks every match in the file shown, counts them and steps through them with Enter. It reads files of any size, a whole log included, and the bytes of anything that isn't text.",
-        body: Body::Film(FIND),
-        keys: &[Cmd::FindInPreview],
+        title: "Maia picks your files",
+        text: "Apps that ask the desktop for a file can get Maia instead of their own dialog, with the filter, previews and every key you know. Turn it on in Options, Startup & system.",
+        body: Body::Film(PICKER),
+        keys: &[Cmd::Options],
     },
     Page {
-        title: "Edit without opening",
-        text: "A small text file can be changed right in the preview, with find and replace. Ctrl+S saves it, keeping its permissions and tags, and Undo brings back the file as it was.",
-        body: Body::Film(EDIT),
-        keys: &[Cmd::EditInPreview],
+        title: "A column for each folder",
+        text: "Columns lays out the way down side by side, one folder to a column. Right goes into a folder and Left back out; everything else works as it does in the list.",
+        body: Body::Film(COLUMNS),
+        keys: &[Cmd::ViewColumns],
     },
     Page {
-        title: "A terminal under your files",
-        text: "The terminal panel opens under the folder shown and follows it as you go. Its keys are the shell's while you type in it.",
-        body: Body::Film(TERMINAL),
-        keys: &[Cmd::TerminalPanel],
+        title: "Say what you want",
+        text: "The filter takes OR, NOT, type:, ext:, owner: and patterns, as in pdf | ext:md -recipes. Save As Smart Folder keeps all of it in the sidebar.",
+        body: Body::Film(FILTER),
+        keys: &[Cmd::FocusFilter, Cmd::SaveSmart],
     },
     Page {
-        title: "Two folders in step",
-        text: "Compare Panels marks what differs, all the way down. Sync lists every copy before it makes one; Mirror also moves what only the other side has to the trash, and one Undo takes it all back.",
-        body: Body::Film(SYNC),
-        keys: &[Cmd::ComparePanels, Cmd::SyncPanels],
+        title: "Search the history",
+        text: "Ctrl+F over the git history finds commits by their words, author:, path: or date. A branch's menu compares it with yours, or merges it in.",
+        body: Body::Film(GITSEARCH),
+        keys: &[Cmd::GitHistory, Cmd::GitSearch],
     },
     Page {
-        title: "Encrypted drives",
-        text: "A locked drive shows a padlock. Open it, type its passphrase, and it is unlocked, mounted and opened; Eject locks it again.",
-        body: Body::Film(UNLOCK),
-        keys: &[Cmd::Computer],
+        title: "Sort photos as you look",
+        text: "In the viewer, Delete puts a picture in the trash, R and L turn it, Ctrl+1 to Ctrl+7 give it a colour, T any tag, and C holds it beside the next one.",
+        body: Body::Film(SORTING),
+        keys: &[Cmd::ViewPictures],
     },
     Page { title: "Also new", text: "", body: Body::List, keys: &[] },
 ];
 
-/// Everything else 0.4.0 added: (group, [(name, one line)]).
+/// Everything else 0.5.0 added: (group, [(name, one line)]).
 pub const ALSO: &[(&str, &[(&str, &str)])] = &[
     (
         "For everyone",
         &[
-            ("Faster copies that keep tags", "Copies clone the file where the disk allows, and keep its tags, permissions and dates."),
-            ("Clearer conflicts", "Both pictures side by side, Replace if newer (N), and Rename with the name ready to type (F2)."),
-            ("Restore asks first", "Restoring from the trash onto a name taken again keeps both, or replaces, as you choose."),
-            ("Permissions and owner", "Properties sets them for many items at once, and for everything inside a folder too."),
-            ("HEIC, AVIF and TIFF", "Shown in the preview and the viewer, turned the right way up."),
-            ("Moving pictures", "GIF, WebP and APNG animations play in the preview and the viewer."),
-            ("Light and dark with the desktop", "With Follow system light/dark on, the theme changes the moment the desktop's does."),
-            ("Copy and drag files on X11", "Files copied in Maia paste into other apps, and drag out of the window into them."),
+            ("Copies take turns", "Copies to and from one disk wait for each other instead of slowing each other down; Start now runs one at once."),
+            ("Check copies", "Every copy read back from the disk and compared with the original (Options, Files & folders)."),
+            ("Redo", "Ctrl+Shift+Z or Ctrl+Y does again what Undo took back, and both outlast a restart."),
+            ("Undo across drives", "A move to another drive is undone by moving it back."),
+            ("Select and copy text", "In every preview: text, Markdown, tables, data, logs and hex."),
+            ("Tags in the sidebar", "Every file with a tag in one place, a Tags column, sort and group by tag, and a tag renamed or removed across your home."),
+            ("Date taken, size and length", "Date Taken, Dimensions and Duration columns; photos grouped by the month they were taken."),
+            ("Change archives", "Add, rename and delete inside zip, 7z and tar files; compress with a name, a level and real progress."),
         ],
     ),
     (
         "For power users",
         &[
-            ("Custom actions", "Your own commands in the right-click menu, made and changed in their own editor (Options, Files & folders)."),
-            ("Open With any command", "Type a command in Open With; %f and %F put the files where you want them."),
-            ("Hex", "Every byte of a file that isn't text, with what it reads as beside it."),
+            ("Copy To and Move To", "Shift+F5 and Shift+F6 pick the folder in Go To, the recent ones first."),
+            ("Select Matching", "A pattern such as *.jpg or IMG_*.{png,jpg} selects what it names."),
+            ("Packages and lone files", ".deb and .rpm packages, and a lone .gz, .xz, .bz2 or .zst file, open like folders."),
         ],
     ),
     (
         "For developers",
         &[
-            ("Diffs side by side", "Old on the left, new on the right, the changed part of each line marked."),
-            ("Git from the history", "A commit's menu checks it out, branches or tags from it, cherry-picks, reverts or resets."),
-            ("Stage lines", "Pick single lines of a change to stage; branches can be deleted from their menu."),
+            ("Several terminals", "Ctrl+Shift+T in the terminal opens another shell; Ctrl+Shift+F searches what scrolled past."),
+            ("Links in the terminal", "Ctrl+click a URL or a file:line to open it; vim, less and tmux get the mouse."),
         ],
     ),
 ];

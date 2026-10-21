@@ -58,39 +58,127 @@ pub enum Drag {
     Bookmark { idx: usize },
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct UndoEntry {
     pub label: String,
     pub kind: UndoKind,
 }
 
-/// What Undo can take back, the newest last, each with when it was done.
+/// What Undo can take back, the newest last, each with when it was done; and what Redo
+/// can do again, the next one last, each with when it was undone. The entries are shared
+/// with the thread that writes them to disk, so writing never copies them on a frame.
 #[derive(Default)]
 pub struct UndoStack {
-    items: Vec<UndoEntry>,
+    items: Vec<std::sync::Arc<UndoEntry>>,
     at: Vec<std::time::SystemTime>,
+    redo: Vec<std::sync::Arc<UndoEntry>>,
+    redo_at: Vec<std::time::SystemTime>,
+    /// Counts every change, for the file that keeps them across restarts.
+    pub(crate) generation: u64,
 }
 
 impl UndoStack {
+    /// A new change: what was undone before it can't be redone any more.
     pub fn push(&mut self, e: UndoEntry) {
-        self.items.push(e);
+        self.forget_redo();
+        self.push_redone(e);
+    }
+
+    /// A change done again by Redo: the rest of what was undone stays to redo.
+    pub fn push_redone(&mut self, e: UndoEntry) {
+        self.items.push(std::sync::Arc::new(e));
         self.at.push(std::time::SystemTime::now());
+        crate::undofile::cap(&mut self.items, &mut self.at);
+        self.generation += 1;
     }
 
     pub fn pop(&mut self) -> Option<UndoEntry> {
         self.at.pop();
-        self.items.pop()
+        let e = self.items.pop()?;
+        self.generation += 1;
+        Some(std::sync::Arc::unwrap_or_clone(e))
+    }
+
+    /// A change taken back, for Redo.
+    pub fn push_undone(&mut self, e: UndoEntry) {
+        self.redo.push(std::sync::Arc::new(e));
+        self.redo_at.push(std::time::SystemTime::now());
+        crate::undofile::cap(&mut self.redo, &mut self.redo_at);
+        self.generation += 1;
+    }
+
+    pub fn pop_redo(&mut self) -> Option<UndoEntry> {
+        self.redo_at.pop();
+        let e = self.redo.pop()?;
+        self.generation += 1;
+        Some(std::sync::Arc::unwrap_or_clone(e))
+    }
+
+    pub fn forget_redo(&mut self) {
+        if !self.redo.is_empty() {
+            self.redo.clear();
+            self.redo_at.clear();
+            self.generation += 1;
+        }
     }
 
     /// When the change at `i` (counted from the oldest) was made.
     pub fn when(&self, i: usize) -> Option<std::time::SystemTime> {
         self.at.get(i).copied()
     }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn last(&self) -> Option<&UndoEntry> {
+        self.items.last().map(|e| &**e)
+    }
+
+    /// What Redo can do again, the next one last.
+    pub fn redos(&self) -> impl ExactSizeIterator<Item = &UndoEntry> + DoubleEndedIterator {
+        self.redo.iter().map(|e| &**e)
+    }
+
+    /// When the change Redo would do `i`-th from the bottom was undone.
+    pub fn undone_when(&self, i: usize) -> Option<std::time::SystemTime> {
+        self.redo_at.get(i).copied()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Both lists as they stand, for the thread that writes them.
+    pub(crate) fn snapshot(&self) -> crate::undofile::Snapshot {
+        let pair = |v: &[std::sync::Arc<UndoEntry>], t: &[std::time::SystemTime]| v.iter().cloned().zip(t.iter().copied()).collect();
+        crate::undofile::Snapshot { undo: pair(&self.items, &self.at), redo: pair(&self.redo, &self.redo_at) }
+    }
+
+    /// What the last run left, under what was done since it started. A change made since
+    /// then leaves nothing to redo.
+    pub(crate) fn restore(&mut self, s: crate::undofile::Snapshot) {
+        let fresh = !self.items.is_empty();
+        let (mut items, mut at): (Vec<_>, Vec<_>) = s.undo.into_iter().unzip();
+        items.append(&mut self.items);
+        at.append(&mut self.at);
+        crate::undofile::cap(&mut items, &mut at);
+        (self.items, self.at) = (items, at);
+        if !fresh && self.redo.is_empty() {
+            (self.redo, self.redo_at) = s.redo.into_iter().unzip();
+        }
+        self.generation += 1;
+    }
 }
 
-impl std::ops::Deref for UndoStack {
-    type Target = [UndoEntry];
-    fn deref(&self) -> &[UndoEntry] {
-        &self.items
+impl std::ops::Index<usize> for UndoStack {
+    type Output = UndoEntry;
+    fn index(&self, i: usize) -> &UndoEntry {
+        &self.items[i]
     }
 }
 
@@ -102,10 +190,12 @@ impl UndoKind {
             UndoKind::Copied(v, _) => v.len(),
             UndoKind::Created(v) | UndoKind::Trashed(v) | UndoKind::Replaced(v) => v.len(),
             UndoKind::Synced(made, _, removed) => made.len() + removed.len(),
+            UndoKind::Tagged(v) => v.len(),
         }
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum UndoKind {
     Rename(Vec<(PathBuf, PathBuf)>),
     Move(Vec<(PathBuf, PathBuf)>),
@@ -123,6 +213,8 @@ pub enum UndoKind {
     /// A sync: copies made, those among them over something (in the trash now), and what
     /// mirroring sent to the trash.
     Synced(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>),
+    /// Files' tags changed: each one's before and after.
+    Tagged(Vec<crate::tags::Change>),
 }
 
 pub struct App {
@@ -157,6 +249,12 @@ pub struct App {
     pub save_session: bool,
     pub jump_buf: (String, Instant),
     pub undo: UndoStack,
+    /// Undo and Redo kept across restarts.
+    pub undo_keep: crate::undofile::Keeper,
+    /// Jobs that move data take turns on each disk.
+    pub queue: std::sync::Arc<ops::Queue>,
+    /// Moves that Undo or Redo handed to a job, by job: what to record when it ends.
+    pub job_steps: HashMap<u64, crate::redo::Step>,
     pub theme_applied: (theme::ThemeName, f32, f32, bool, bool),
     pub ctx: egui::Context,
     pub fresh: bool,
@@ -232,6 +330,12 @@ pub struct App {
     appearance_seen: u8,
     /// The theme left behind when the desktop last switched, to come back to.
     pub other_theme: Option<theme::ThemeName>,
+    /// This window answers an app's Open or Save request (picker.rs).
+    pub picker: Option<Box<crate::picker::Picker>>,
+    /// Whether apps open and save files with Maia: 0 not known yet, 1 no, 2 yes, 3 asking;
+    /// and what keeps it from working here.
+    picker_on: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    picker_missing: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
 /// What a thread sharing files hands back: text for the clipboard, what to say, and a
@@ -304,6 +408,10 @@ impl App {
             save_session: paths.is_empty(),
             jump_buf: (String::new(), Instant::now()),
             undo: UndoStack::default(),
+            // Tests share one home: only those that check keeping Undo ask for it.
+            undo_keep: crate::undofile::Keeper::new((!cfg!(test)).then(crate::undofile::path), &ctx),
+            queue: Default::default(),
+            job_steps: HashMap::new(),
             theme_applied: (cfg.theme, cfg.font_size, cfg.spacing, cfg.animations, cfg.syntax_theme),
             ctx: ctx.clone(),
             fresh: true,
@@ -344,6 +452,9 @@ impl App {
             appearance: Default::default(),
             appearance_seen: crate::appearance::UNKNOWN,
             other_theme: None,
+            picker: None,
+            picker_on: Default::default(),
+            picker_missing: Default::default(),
             cfg,
             ud,
         };
@@ -378,7 +489,10 @@ impl App {
             app.active = id;
             app.prev_active = id;
         }
-        crate::tour::at_start(&mut app, first);
+        // A picker window is there for one answer: no tour, no news.
+        if !crate::picker::picking() {
+            crate::tour::at_start(&mut app, first);
+        }
         app
     }
 
@@ -501,6 +615,47 @@ impl App {
             let r = if on { crate::install::set_default() } else { crate::install::unset_default() };
             let msg = r.unwrap_or_else(|e| format!("Couldn't change the default file manager: {e}"));
             state.store(if crate::install::is_default() { 2 } else { 1 }, Relaxed);
+            notes.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Whether apps open and save files with Maia (None while that is being read; the
+    /// first call starts reading it in the background).
+    pub fn picker_setting(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.picker_on.load(Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            3 => None,
+            _ => {
+                self.picker_on.store(3, Relaxed);
+                let (state, missing, ctx) = (self.picker_on.clone(), self.picker_missing.clone(), self.ctx.clone());
+                std::thread::spawn(move || {
+                    let (on, m) = crate::portal::state();
+                    *missing.lock().unwrap_or_else(|e| e.into_inner()) = m;
+                    state.store(if on { 2 } else { 1 }, Relaxed);
+                    ctx.request_repaint();
+                });
+                None
+            }
+        }
+    }
+
+    /// What keeps the portal from reaching Maia here, once known.
+    pub fn picker_missing(&self) -> Option<&'static str> {
+        *self.picker_missing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Route the desktop's Open and Save dialogs to Maia, or back, in the background.
+    pub fn set_picker_setting(&mut self, on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.picker_on.store(if on { 2 } else { 1 }, Relaxed);
+        let (state, notes, ctx) = (self.picker_on.clone(), self.notes.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let r = crate::portal::set(on);
+            let msg = r.unwrap_or_else(|e| format!("Couldn't change the Open and Save dialog: {e}"));
+            state.store(if crate::portal::is_on(&crate::portal::Places::user()) { 2 } else { 1 }, Relaxed);
             notes.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
             ctx.request_repaint();
         });
@@ -631,6 +786,10 @@ impl App {
     /// choice waits until it has been left alone a while: the choice steps through 7
     /// days on its way to 30, and that must not take what 30 would keep.
     fn age_trash(&mut self) {
+        // The main window's job: a picker is open for a few seconds.
+        if self.picker.is_some() {
+            return;
+        }
         const EVERY: Duration = Duration::from_secs(6 * 3600);
         const SETTLE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 60 });
         let days = self.cfg.trash_days;
@@ -939,7 +1098,7 @@ impl App {
                     t.scroll_to_cursor = true;
                 }
                 t.saved_scope = self.ud.views.get(&path).map(|v| v.scope);
-                match ts.smart.and_then(|id| crate::smart::by_id(&self.ud.smart, id)) {
+                match ts.smart.and_then(|id| crate::smart::by_id_in(&self.ud, id)) {
                     Some(sf) if sf.root == path => t.open_smart(sf, None),
                     _ if ts.flatten => t.set_flatten(true),
                     _ => {}
@@ -1115,6 +1274,7 @@ impl App {
         }
         self.pump(&ctx);
         crate::hints::input(self, &ctx);
+        crate::picker::keys(self, &ctx);
         self.handle_input(&ctx);
         self.draw(&ctx);
         self.process_actions(&ctx);
@@ -1130,12 +1290,14 @@ impl App {
 
     /// Poll background work: listings, walks, stats, thumbnails, jobs, watcher.
     fn pump(&mut self, ctx: &egui::Context) {
+        crate::picker::sync(self);
         self.pump_drives(ctx);
         self.pump_requests(ctx);
         self.pump_net();
         self.pump_shares(ctx);
         self.age_trash();
         crate::errands::pump(self);
+        crate::tags::pump(self);
         self.shelf.pump(ctx);
         let look = self.appearance.load(std::sync::atomic::Ordering::Relaxed);
         if look != self.appearance_seen {
@@ -1165,6 +1327,20 @@ impl App {
         for f in &changed_files {
             self.thumbs.invalidate(f);
             crate::tags::invalidate(f);
+            crate::facts::invalidate(f);
+        }
+        // Dates taken, sizes and lengths: asked for by last frame's rows, read only for
+        // the folders shown; a list sorted or grouped by them looks again as they land.
+        let mut shown: Vec<PathBuf> = self.panels.values().map(|p| p.tab().path.clone()).collect();
+        shown.sort();
+        crate::facts::focus(shown);
+        crate::facts::flush(ctx);
+        if crate::facts::changed() {
+            for t in self.panels.values_mut().flat_map(|p| p.tabs.iter_mut()) {
+                if matches!(t.settings.sort, SortKey::Taken | SortKey::Dimensions | SortKey::Duration) || t.settings.group == crate::config::GroupBy::Taken {
+                    t.stream_dirty = true;
+                }
+            }
         }
         // Tags asked for by last frame's rows go to the reader; when some land, a tag:
         // filter looks again.
@@ -1173,10 +1349,12 @@ impl App {
         if tg != self.tags_gen {
             self.tags_gen = tg;
             for t in self.panels.values_mut().flat_map(|p| p.tabs.iter_mut()) {
-                if t.filter.contains("tag") {
+                if t.filter.contains("tag") || t.settings.sort == SortKey::Tags || t.settings.group == crate::config::GroupBy::Tag {
                     t.stream_dirty = true;
                 }
             }
+            // Tags met on files join the sidebar's.
+            self.ud_dirty |= crate::tags::remember(&mut self.ud.tags);
         }
         for d in &changed_dirs {
             self.stats.invalidate(d);
@@ -1221,6 +1399,9 @@ impl App {
                 }
                 if t.is_loading() {
                     any_loading = true;
+                }
+                if ti == p.active {
+                    crate::columns::watch(t, &changed_dirs, &mut want);
                 }
                 if ti == p.active && !tab::is_computer(&t.path) && !t.flatten && t.archive.is_none() {
                     want.insert(t.path.clone());
@@ -1393,8 +1574,17 @@ impl App {
                         self.undo.push(UndoEntry { label: crate::ui::job_undo_label(&j.label), kind: UndoKind::Synced(made, p.replaced.clone(), p.gone.clone()) });
                     }
                 }
+                // Changed in place: the old one is in the trash, for Undo to swap back.
+                if let OpKind::ArchiveEdit { archive, .. } = &j.kind {
+                    if !p.replaced.is_empty() {
+                        self.undo.push(UndoEntry { label: crate::ui::job_undo_label(&j.label), kind: UndoKind::Replaced(vec![archive.clone()]) });
+                    }
+                }
                 if let OpKind::Trash { paths } = &j.kind {
                     self.undo.push(UndoEntry { label: crate::ui::job_undo_label(&j.label), kind: UndoKind::Trashed(paths.clone()) });
+                }
+                if let Some(step) = self.job_steps.remove(&j.id) {
+                    crate::redo::placed(&mut self.undo, step, &p);
                 }
             }
         }
@@ -1438,6 +1628,7 @@ impl App {
         if !self.jobs.is_empty() || any_loading || self.watch.has_pending() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.undo_keep.pump(&mut self.undo, &ctx);
         if self.seq.len() > 0 && self.seq_time.elapsed() > Duration::from_millis(1100) {
             self.seq.clear();
         }
@@ -1599,6 +1790,11 @@ impl App {
                 if !matches!(self.keymap.lookup(&[chord]).0, Some(Cmd::Palette | Cmd::Options | Cmd::Quit)) {
                     continue;
                 }
+            }
+            // Ctrl+C and Ctrl+A in a preview that has the keyboard take its selection.
+            if !text_focus && chord.ctrl && !chord.alt && !chord.shift && matches!(chord.input, commands::Input::Key(Key::C | Key::A)) && crate::textsel::key(self, ctx, chord.input == commands::Input::Key(Key::C)) {
+                consumed.push(n);
+                continue;
             }
             if text_focus {
                 // Filter box: arrows/enter drive the list; plain typing stays in the box.
@@ -1781,6 +1977,9 @@ impl App {
             }
             _ => return false,
         };
+        if matches!(k, Key::ArrowLeft | Key::ArrowRight) && t.settings.column_view {
+            return crate::columns::step(self, k == Key::ArrowRight);
+        }
         if matches!(k, Key::ArrowLeft | Key::ArrowRight) && t.nav_col_step == 0 {
             // Details tree: Right expands / enters, Left collapses / goes to the parent row.
             if !t.tree_active() {
@@ -1829,9 +2028,8 @@ impl App {
         if tab::is_computer(&self.panel().path()) && matches!(cmd, Cmd::Cut | Cmd::Trash | Cmd::DeletePermanent | Cmd::Duplicate | Cmd::CreateLink | Cmd::Paste | Cmd::Rename) {
             return;
         }
-        // Inside an archive nothing changes; copying out (Copy, then Paste elsewhere) works.
-        if self.tab().archive.is_some() && matches!(cmd, Cmd::Cut | Cmd::Trash | Cmd::DeletePermanent | Cmd::Duplicate | Cmd::CreateLink | Cmd::Paste | Cmd::Rename | Cmd::NewFolder | Cmd::NewFile) {
-            self.toast("Archives are read-only here: extract it to change it");
+        // Inside an archive: zip, 7z and tarballs change by a job that rewrites them.
+        if self.tab().archive.is_some() && matches!(cmd, Cmd::Cut | Cmd::Trash | Cmd::DeletePermanent | Cmd::Duplicate | Cmd::CreateLink | Cmd::Paste | Cmd::Rename | Cmd::NewFolder | Cmd::NewFile) && crate::archwrite::inside(self, cmd) {
             return;
         }
         match cmd {
@@ -1880,6 +2078,7 @@ impl App {
                     i.invalidate();
                 }
             }
+            Cmd::Activate if crate::picker::enter(self) => {}
             Cmd::Activate => {
                 let t = self.tab();
                 let targets: Vec<u32> = if t.selected.len() > 1 {
@@ -1937,6 +2136,11 @@ impl App {
                 }
             }
             Cmd::TerminalPanel => crate::terminal::toggle(self),
+            Cmd::NewTerminal => crate::terminal::new_shell(self),
+            Cmd::CloseTerminal => crate::terminal::close_shell(self, self.terminal.cur),
+            Cmd::NextTerminal => crate::terminal::switch(self, 1),
+            Cmd::PrevTerminal => crate::terminal::switch(self, -1),
+            Cmd::FindInTerminal => crate::terminal::find(self),
             Cmd::OpenTerminal => {
                 let p = self.panel().path();
                 let dir = if tab::is_computer(&p) { PathBuf::from("/") } else { p };
@@ -2092,6 +2296,7 @@ impl App {
                     self.begin_transfer(srcs, dest, cmd == Cmd::MoveToOther);
                 }
             }
+            Cmd::CopyTo | Cmd::MoveTo => crate::copyto::open(self, cmd == Cmd::MoveTo),
             Cmd::ToggleFlatten => {
                 let t = self.tab();
                 if t.tree_active() {
@@ -2102,6 +2307,8 @@ impl App {
                     t.set_flatten(on);
                 }
             }
+            // Ctrl+F searches an open history that has the keyboard.
+            Cmd::FocusFilter | Cmd::FindInPreview if self.panels.get(&self.active).and_then(|p| p.inspector.as_ref()).is_some_and(|i| i.git.is_some() && (i.keys || cmd == Cmd::FindInPreview)) => self.run(Cmd::GitSearch),
             // Ctrl+F finds in a preview that was clicked last, else filters the list.
             Cmd::FocusFilter if self.panels.get(&self.active).and_then(|p| p.inspector.as_ref()).is_some_and(|i| i.keys || i.find.is_some() && self.ctx.memory(|m| m.focused()) == Some(egui::Id::new(("insp-find", self.active)))) => self.run(Cmd::FindInPreview),
             Cmd::FocusFilter => self.panel().focus_filter = true,
@@ -2224,6 +2431,7 @@ impl App {
                 self.popup = Popup::meaning();
             }
             Cmd::ComparePanels | Cmd::SelectDifferences | Cmd::SyncPanels => crate::compare::run(self, cmd),
+            Cmd::TypesFilter if crate::picker::open_filters(self) => {}
             Cmd::TypesFilter => self.popup = Popup::types(self.active),
             Cmd::ToggleHidden => {
                 self.cfg.show_hidden = !self.cfg.show_hidden;
@@ -2242,6 +2450,8 @@ impl App {
                 self.set_config_changed();
             }
             Cmd::ToggleSidebar => self.sidebar = !self.sidebar,
+            // Columns sits beside the zoom axis: there is nothing in it to grow.
+            Cmd::ZoomIn | Cmd::ZoomOut if self.tab().settings.column_view => {}
             Cmd::ZoomIn | Cmd::ZoomOut => {
                 let t = self.tab();
                 t.settings.zoom = crate::listing::zoom_step(t.settings.zoom, if cmd == Cmd::ZoomIn { 1 } else { -1 });
@@ -2258,11 +2468,35 @@ impl App {
                 };
                 let t = self.tab();
                 t.settings.zoom = z;
+                // (Groups come back with the other views.)
+                t.dirty |= std::mem::take(&mut t.settings.column_view);
+                t.scroll_to_cursor = true;
+            }
+            Cmd::ViewColumns => {
+                let t = self.tab();
+                t.settings.column_view = true;
+                t.dirty = true;
                 t.scroll_to_cursor = true;
             }
             Cmd::GroupNone | Cmd::GroupName | Cmd::GroupType | Cmd::GroupDate | Cmd::GroupCreated | Cmd::GroupAccessed | Cmd::GroupSize | Cmd::GroupItems | Cmd::GroupUsage | Cmd::GroupDeleted | Cmd::GroupOriginal | Cmd::GroupFree | Cmd::GroupFs | Cmd::GroupFull => {
                 let t = self.tab();
                 t.settings.group = cmd.group_key().unwrap_or_default();
+                t.collapsed_groups.clear();
+                t.dirty = true;
+            }
+            Cmd::GroupTag => {
+                let t = self.tab();
+                t.settings.group = crate::config::GroupBy::Tag;
+                t.collapsed_groups.clear();
+                t.dirty = true;
+            }
+            Cmd::SortTags => self.tab().set_sort(SortKey::Tags),
+            Cmd::SortTaken => self.tab().set_sort(SortKey::Taken),
+            Cmd::SortDimensions => self.tab().set_sort(SortKey::Dimensions),
+            Cmd::SortDuration => self.tab().set_sort(SortKey::Duration),
+            Cmd::GroupTaken => {
+                let t = self.tab();
+                t.settings.group = crate::config::GroupBy::Taken;
                 t.collapsed_groups.clear();
                 t.dirty = true;
             }
@@ -2370,6 +2604,20 @@ impl App {
                     self.toast("Not in a git repository");
                 } else {
                     self.toast(if on { "Showing only changed files" } else { "Showing every file" });
+                }
+            }
+            Cmd::GitSearch => {
+                let p = self.panel();
+                // An open history is searched as it is; else this folder's is opened.
+                if p.inspector.as_ref().and_then(|i| i.git.as_ref()).is_none() {
+                    let Some(r) = crate::gitstatus::repo_for(&p.path()) else { return };
+                    let opened = p.inspector.is_none();
+                    p.inspector.get_or_insert_with(Inspector::default).show_history(crate::gitlog::History::new(r.root.clone(), r.branch.clone(), opened));
+                }
+                let here = p.path();
+                if let Some(h) = p.inspector.as_mut().and_then(|i| i.git.as_mut()) {
+                    h.here = here.strip_prefix(&h.root).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
+                    h.find();
                 }
             }
             Cmd::GitChanges => {
@@ -2682,40 +2930,20 @@ impl App {
                     crate::convert::start(self, to);
                 }
             }
-            Cmd::CompressLocked => {
+            Cmd::CompressLocked | Cmd::CompressZip | Cmd::CompressTarGz | Cmd::CompressTarXz | Cmd::Compress7z => {
                 let t = self.tab();
                 let srcs = t.targets();
                 if t.archive.is_some() || tab::is_computer(&t.path) || srcs.is_empty() {
                     self.toast("Select what to compress");
                     return;
                 }
-                self.popup = Popup::Lock(crate::popups::LockState::new(srcs, t.path.clone()));
-            }
-            Cmd::CompressZip | Cmd::CompressTarGz | Cmd::CompressTarXz | Cmd::Compress7z => {
-                let t = self.tab();
-                if t.archive.is_some() || tab::is_computer(&t.path) {
-                    return;
-                }
-                let srcs = t.targets();
-                if srcs.is_empty() {
-                    return;
-                }
-                let ext = match cmd {
-                    Cmd::CompressTarGz => "tar.gz",
-                    Cmd::CompressTarXz => "tar.xz",
-                    Cmd::Compress7z => "7z",
-                    _ => "zip",
+                let format = match cmd {
+                    Cmd::CompressTarGz => crate::archwrite::Format::TarGz,
+                    Cmd::CompressTarXz => crate::archwrite::Format::TarXz,
+                    Cmd::Compress7z => crate::archwrite::Format::SevenZ,
+                    _ => crate::archwrite::Format::Zip,
                 };
-                // One item is named after itself ("photo.png" -> "photo.zip"); several, "Archive".
-                let base = match srcs.as_slice() {
-                    [one] => {
-                        let n = one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if one.is_dir() { n } else { std::path::Path::new(&n).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(n) }
-                    }
-                    _ => "Archive".to_string(),
-                };
-                let out = fsx::unique_dest(&t.path, &format!("{base}.{ext}"));
-                self.actions.push(Action::StartJob(OpKind::Compress { srcs, out, password: None }));
+                self.popup = Popup::Compress(crate::popups::CompressState::new(srcs, t.path.clone(), format, cmd == Cmd::CompressLocked));
             }
             Cmd::CreateLink => {
                 let paths = self.tab().targets();
@@ -2751,7 +2979,7 @@ impl App {
             Cmd::ContextMenu => {
                 let id = self.active;
                 // An open history has the keyboard: the selected commit's menu.
-                match self.panels.get(&id).and_then(|p| p.inspector.as_ref()?.git.as_ref()?.menu()) {
+                match self.panels.get(&id).and_then(|p| p.inspector.as_ref()?.git.as_ref()?.menu(id)) {
                     Some(m) => self.popup = m,
                     None => {
                         let pos = self.tab().cursor_screen_pos.unwrap_or_else(|| self.panels[&id].list_rect.center());
@@ -2786,6 +3014,7 @@ impl App {
                 let all: HashSet<u32> = t.view.iter().copied().collect();
                 t.selected = all.difference(&t.selected).copied().collect();
             }
+            Cmd::SelectMatching => self.popup = Popup::prompt("Select matching", String::new(), Box::new(|app: &mut App, text: String| crate::selmatch::run(app, &text))),
             Cmd::ToggleSelection => {
                 let t = self.tab();
                 if let Some(c) = t.cursor {
@@ -2864,10 +3093,13 @@ impl App {
             Cmd::About => self.popup = Popup::About,
             Cmd::Welcome => self.popup = crate::tour::open(crate::tour::Kind::Welcome, false),
             Cmd::WhatsNew => self.popup = crate::tour::open(crate::tour::Kind::News, false),
+            Cmd::Redo => {
+                self.redo_last();
+            }
             Cmd::Undo => {
                 self.undo_last();
             }
-            Cmd::UndoHistory => self.popup = Popup::UndoHistory(crate::undohist::State { sel: 0 }),
+            Cmd::UndoHistory => self.popup = Popup::UndoHistory(crate::undohist::State::new(&self.undo)),
             Cmd::Hints => crate::hints::start(self, &ctx),
             Cmd::SetMark => match crate::marks::here(self) {
                 Some(_) => self.popup = Popup::Marks(crate::marks::State { set: true, sel: 0 }),
@@ -2882,7 +3114,7 @@ impl App {
         t.target_entries().first().filter(|e| e.is_dir).map(|e| e.path.clone()).unwrap_or_else(|| t.path.clone())
     }
 
-    fn move_cursor_past_selection(&mut self) {
+    pub(crate) fn move_cursor_past_selection(&mut self) {
         let t = self.tab();
         let positions: Vec<usize> = t.targets_idx().iter().filter_map(|&i| t.view_pos(i)).collect();
         let (Some(&lo), Some(&hi)) = (positions.iter().min(), positions.iter().max()) else { return };
@@ -3108,11 +3340,12 @@ impl App {
 
     /// Start a copy/move, asking about conflicts first.
     pub fn begin_transfer(&mut self, srcs: Vec<PathBuf>, dest: PathBuf, mv: bool) {
-        // Out of an archive: extracted (always a copy; the archive stays as it is).
+        // Into an archive: a job that rewrites it.
         if crate::archive::split(&dest).is_some() && !dest.is_dir() {
-            self.toast("Archives are read-only here: extract it to change it");
+            crate::archwrite::add(self, srcs, &dest, mv);
             return;
         }
+        // Out of an archive: extracted (always a copy; the archive stays as it is).
         if srcs.iter().any(|s| !s.exists() && crate::archive::split(s).is_some()) {
             for (archive, members) in crate::archive::group(&srcs) {
                 self.actions.push(Action::StartJob(OpKind::Extract { archive, members, dest: dest.clone() }));
@@ -3141,7 +3374,7 @@ impl App {
 
     /// Every tab that shows what changed reads it again, front or not, and the folders'
     /// sizes are counted again.
-    fn show_changed(&mut self, c: &ops::Changed) {
+    pub(crate) fn show_changed(&mut self, c: &ops::Changed) {
         if c.is_empty() {
             return;
         }
@@ -3155,7 +3388,7 @@ impl App {
 
     pub fn start_job(&mut self, kind: OpKind) {
         let id = self.alloc_id();
-        self.jobs.push(ops::spawn(id, kind, self.ctx.clone()));
+        self.jobs.push(ops::spawn_in(id, kind, self.ctx.clone(), &self.queue, self.cfg.check_copies));
     }
 
     fn restore_from_trash(&mut self) {
@@ -3221,15 +3454,34 @@ impl App {
         self.tab().reload();
     }
 
-    /// Take back the latest change; false when some of it couldn't be.
+    /// Take back the latest change; false when some of it couldn't be. What was taken
+    /// back goes to Redo. A move across disks goes back through a job with its card.
     pub fn undo_last(&mut self) -> bool {
+        if !self.job_steps.is_empty() {
+            self.toast("Undo waits for the move under way");
+            return false;
+        }
+        if crate::tags::busy() {
+            self.toast("Undo waits for the tags being changed");
+            return false;
+        }
+        // When the change was made: a version trashed after it (by an Undo since) is not
+        // the one it replaced.
+        let made = self.undo.len().checked_sub(1).and_then(|i| self.undo.when(i));
         let Some(u) = self.undo.pop() else {
             self.toast("Nothing to undo");
             return true;
         };
+        let here = |p: &Path| std::fs::symlink_metadata(p).is_ok();
         let mut errs = 0;
         let mut moved_back = ops::Changed::default();
-        match &u.kind {
+        // What Redo would do again: the part of the change that was taken back.
+        let again = match &u.kind {
+            UndoKind::Tagged(ch) => {
+                self.toast(format!("Undid “{}”", u.label));
+                crate::tags::start(self, crate::tags::Job::Restore(ch.clone(), true), crate::tags::Record::Undid(u.label.clone()));
+                return true;
+            }
             UndoKind::Rename(pairs) => {
                 let plan: Vec<(PathBuf, String)> = pairs
                     .iter()
@@ -3238,61 +3490,70 @@ impl App {
                 errs = crate::rename::apply(&plan).len();
                 let back: Vec<(PathBuf, PathBuf)> = pairs.iter().map(|(from, to)| (to.clone(), from.clone())).collect();
                 moved_back = ops::Changed::moved(&back);
+                UndoKind::Rename(pairs.iter().filter(|(from, to)| here(from) && !here(to)).cloned().collect())
             }
             UndoKind::Copied(made, replaced) => {
                 // The copies over something: theirs back from the trash in their place.
-                errs += crate::picfix::undo_replaced(replaced);
-                errs += made.iter().filter(|p| !replaced.contains(p) && crate::trashcan::delete(p).is_err()).count();
+                let swapped = crate::redo::swap_each(replaced, &mut errs);
+                let gone = crate::redo::trash_each(made.iter().filter(|p| !replaced.contains(p)), &mut errs);
+                UndoKind::Copied(gone.into_iter().chain(swapped.iter().cloned()).collect(), swapped)
             }
             UndoKind::Synced(made, replaced, removed) => {
-                errs += crate::picfix::undo_replaced(replaced);
-                errs += made.iter().filter(|p| !replaced.contains(p) && crate::trashcan::delete(p).is_err()).count();
+                let swapped = crate::redo::swap_each(replaced, &mut errs);
+                let gone = crate::redo::trash_each(made.iter().filter(|p| !replaced.contains(p)), &mut errs);
                 // What mirroring removed, back where it was.
-                for r in removed {
-                    match crate::picfix::newest_trashed(r) {
-                        Some(it) if std::fs::symlink_metadata(r).is_err() => errs += crate::trashcan::restore(&it).is_err() as usize,
-                        _ => errs += 1,
-                    }
-                }
+                let back = crate::redo::untrash_each(removed, &mut errs);
+                UndoKind::Synced(gone.into_iter().chain(swapped.iter().cloned()).collect(), swapped, back)
+            }
+            UndoKind::Move(pairs) | UndoKind::MovedOver(pairs, _) if crate::redo::crosses(pairs.iter().map(|(s, d)| (d.as_path(), s.as_path()))) => {
+                let over = matches!(u.kind, UndoKind::MovedOver(..));
+                let back = match &u.kind {
+                    UndoKind::MovedOver(_, r) => r.clone(),
+                    _ => vec![],
+                };
+                let pairs: Vec<(PathBuf, PathBuf)> = pairs.iter().map(|(s, d)| (d.clone(), s.clone())).collect();
+                let label = crate::redo::place_label(&pairs, true);
+                let id = self.alloc_id();
+                self.job_steps.insert(id, crate::redo::Step::Undid { label: u.label.clone(), over });
+                self.jobs.push(ops::spawn_in(id, OpKind::Place { pairs, over: vec![], back, label }, self.ctx.clone(), &self.queue, self.cfg.check_copies));
+                return true;
             }
             UndoKind::MovedOver(pairs, replaced) => {
                 let mut back = vec![];
                 for (src, dst) in pairs {
-                    if std::fs::symlink_metadata(src).is_ok() || crate::fsx::rename_new(dst, src).is_err() {
+                    if here(src) || crate::fsx::rename_new(dst, src).is_err() {
                         errs += 1;
                     } else {
                         back.push((dst.clone(), src.clone()));
                     }
                 }
                 // What was there before comes back from the trash, now its place is free.
-                for r in replaced {
-                    match crate::trashcan::list().into_iter().filter(|i| i.original == *r).max_by(|a, b| a.deleted.cmp(&b.deleted)) {
-                        Some(it) if std::fs::symlink_metadata(r).is_err() => errs += crate::trashcan::restore(&it).is_err() as usize,
-                        _ => errs += 1,
-                    }
-                }
+                let restored = crate::redo::untrash_each(replaced, &mut errs);
                 moved_back = ops::Changed::moved(&back);
                 moved_back.arrived.extend(replaced.iter().filter_map(|r| r.parent().map(Path::to_path_buf)));
+                UndoKind::MovedOver(back.into_iter().map(|(d, s)| (s, d)).collect(), restored)
             }
             UndoKind::Move(pairs) => {
                 let mut back = vec![];
                 for (src, dst) in pairs {
-                    if std::fs::symlink_metadata(src).is_ok() || std::fs::rename(dst, src).is_err() {
+                    if here(src) || std::fs::rename(dst, src).is_err() {
                         errs += 1;
                     } else {
                         back.push((dst.clone(), src.clone()));
                     }
                 }
                 moved_back = ops::Changed::moved(&back);
+                UndoKind::Move(back.into_iter().map(|(d, s)| (s, d)).collect())
             }
             UndoKind::Created(paths) => {
-                errs += paths.iter().filter(|p| crate::trashcan::delete(p).is_err()).count();
+                let gone = crate::redo::trash_each(paths.iter(), &mut errs);
                 for p in paths {
                     moved_back.gone.push(p.clone());
                     if let Some(d) = p.parent().filter(|d| !moved_back.left.iter().any(|x| x == d)) {
                         moved_back.left.push(d.to_path_buf());
                     }
                 }
+                UndoKind::Created(gone)
             }
             UndoKind::Trashed(orig) => {
                 // Restore the most recent trash entry for each original path.
@@ -3305,12 +3566,13 @@ impl App {
                 let back: Vec<(PathBuf, PathBuf)> = best.values().filter(|it| crate::trashcan::restore(it).is_ok()).map(|it| (it.file.clone(), it.original.clone())).collect();
                 errs += best.len() - back.len();
                 moved_back = ops::Changed::moved(&back);
+                UndoKind::Trashed(orig.iter().filter(|p| back.iter().any(|b| b.1 == **p)).cloned().collect())
             }
-            UndoKind::Replaced(paths) => errs += crate::picfix::undo_replaced(paths),
+            UndoKind::Replaced(paths) => UndoKind::Replaced(crate::redo::swap_each_by(paths, made, &mut errs)),
             UndoKind::Sorted(pairs, made) => {
                 let mut back = vec![];
                 for (src, dst) in pairs {
-                    if std::fs::symlink_metadata(src).is_ok() || std::fs::rename(dst, src).is_err() {
+                    if here(src) || std::fs::rename(dst, src).is_err() {
                         errs += 1;
                     } else {
                         back.push((dst.clone(), src.clone()));
@@ -3318,12 +3580,19 @@ impl App {
                 }
                 moved_back = ops::Changed::moved(&back);
                 // Innermost first; one something else was put into stays.
+                let mut removed = vec![];
                 for d in made.iter().rev() {
                     if std::fs::remove_dir(d).is_ok() {
                         moved_back.gone.push(d.clone());
+                        removed.push(d.clone());
                     }
                 }
+                removed.reverse();
+                UndoKind::Sorted(back.into_iter().map(|(d, s)| (s, d)).collect(), removed)
             }
+        };
+        if again.count() > 0 {
+            self.undo.push_undone(UndoEntry { label: u.label.clone(), kind: again });
         }
         if moved_back.is_empty() {
             for p in self.panels.values_mut() {
@@ -3497,6 +3766,9 @@ impl App {
     }
 
     fn activate(&mut self, panel: u64, idx: u32, mods: Modifiers) {
+        if crate::picker::activate(self, panel, idx) {
+            return;
+        }
         let Some(p) = self.panels.get_mut(&panel) else { return };
         let t = p.tab_mut();
         let Some(e) = t.entries.get(idx as usize).cloned() else { return };
@@ -3641,6 +3913,9 @@ impl App {
     }
 
     fn commit_rename(&mut self, panel: u64) {
+        if crate::archwrite::commit_rename(self, panel) {
+            return;
+        }
         let Some(p) = self.panels.get_mut(&panel) else { return };
         let t = p.tab_mut();
         let Some(r) = t.rename.as_mut() else { return };
@@ -3695,8 +3970,12 @@ impl App {
         if cfg!(test) {
             return;
         }
-        self.keep_workspace();
+        // A picker's one folder is not how the project was left.
+        if self.picker.is_none() {
+            self.keep_workspace();
+        }
         let ctx = self.ctx.clone();
         self.save_all(&ctx);
+        self.undo_keep.flush(&self.undo);
     }
 }

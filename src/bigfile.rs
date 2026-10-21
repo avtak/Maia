@@ -59,6 +59,10 @@ pub struct Pager {
     asked: Option<(u64, u64)>,
     /// A search through the whole file, while there is one.
     pub find: Option<Find>,
+    /// Text selected, by line and byte as shown; or bytes (both ends taken), and whether
+    /// as their text rather than as hex.
+    pub sel: Option<crate::textsel::Sel>,
+    pub hsel: Option<(crate::textsel::Sel<u64>, bool)>,
 }
 
 impl Pager {
@@ -69,7 +73,7 @@ impl Pager {
         let (tx, rx) = channel();
         let (ix, ctx) = (index.clone(), ctx.clone());
         std::thread::spawn(move || worker(f, size, ix, req_rx, tx, ctx));
-        Some(Pager { path: path.to_path_buf(), size, hex, bpr: 16, seen: (0, 0), reveal: None, spans: None, index, req, rx, got: None, asked: None, find: None })
+        Some(Pager { path: path.to_path_buf(), size, hex, bpr: 16, seen: (0, 0), reveal: None, spans: None, index, req, rx, got: None, asked: None, find: None, sel: None, hsel: None })
     }
 
     /// Lines known (text), or hex rows; and whether that is all of them.
@@ -146,6 +150,54 @@ impl Pager {
             Some(Got::Lines(f, v)) => Some((*f, v)),
             _ => None,
         }
+    }
+
+    /// The text selected, read on a worker from the nearest line counted before it, as
+    /// the lines are shown; at most `MAX_COPY` bytes of it (then the flag is set).
+    pub fn copy_lines(&self, sel: crate::textsel::Sel, ctx: &egui::Context) -> Receiver<(String, bool)> {
+        let (tx, rx) = channel();
+        let ((l0, _), _) = sel.span();
+        let start = self.index.lock().unwrap().marks.get(l0 / STEP as usize).copied();
+        let (path, ctx) = (self.path.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let got = match (start, File::open(&path)) {
+                (Some(start), Ok(f)) => selected_lines(&f, start, l0 - l0 % STEP as usize, &sel, crate::textsel::MAX_COPY as usize),
+                _ => (String::new(), false),
+            };
+            let _ = tx.send(got);
+            ctx.request_repaint();
+        });
+        rx
+    }
+
+    /// The bytes selected, read on a worker: as hex pairs, or as the text column shows
+    /// them (a dot for what isn't printable); at most `MAX_COPY` bytes read.
+    pub fn copy_bytes(&self, sel: crate::textsel::Sel<u64>, text: bool, ctx: &egui::Context) -> Receiver<(String, bool)> {
+        let (tx, rx) = channel();
+        let (a, b) = sel.span();
+        let (path, size, ctx) = (self.path.clone(), self.size, ctx.clone());
+        std::thread::spawn(move || {
+            let end = b.min(size.saturating_sub(1));
+            let cut = end + 1 - a.min(end + 1) > crate::textsel::MAX_COPY / 3;
+            let end = if cut { a + crate::textsel::MAX_COPY / 3 - 1 } else { end };
+            let mut out = String::new();
+            if let Ok(f) = File::open(&path) {
+                let mut buf = vec![0u8; 256 << 10];
+                let mut at = a;
+                while at <= end {
+                    let want = ((end + 1 - at) as usize).min(buf.len());
+                    let n = f.read_at(&mut buf[..want], at).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    out.push_str(&bytes_text(&buf[..n], text, at == a));
+                    at += n as u64;
+                }
+            }
+            let _ = tx.send((out, cut));
+            ctx.request_repaint();
+        });
+        rx
     }
 
     /// Search the whole file for `q` (text: ignoring ASCII case, hits are lines; hex:
@@ -265,6 +317,78 @@ fn read_lines(f: &File, start: u64, skip: u64, n: u64) -> Vec<String> {
         }
     }
     out
+}
+
+/// Bytes as the hex view's columns show them: pairs of hex digits with a space between
+/// (`first`: none before the first), or their text, a dot for each byte not printable.
+pub fn bytes_text(b: &[u8], text: bool, first: bool) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(b.len() * if text { 1 } else { 3 });
+    for (i, &c) in b.iter().enumerate() {
+        if text {
+            s.push(if (32..127).contains(&c) { c as char } else { '.' });
+        } else {
+            if i > 0 || !first {
+                s.push(' ');
+            }
+            let _ = write!(s, "{c:02x}");
+        }
+    }
+    s
+}
+
+/// The selected part of the lines from byte `start`, where line `first` begins: each as
+/// `line_text` makes it, so the bytes the selection counts are the ones shown.
+pub fn selected_lines(f: &File, start: u64, first: usize, sel: &crate::textsel::Sel, max: usize) -> (String, bool) {
+    let ((l0, _), (l1, _)) = sel.span();
+    let mut out = String::new();
+    let mut buf = vec![0u8; 256 << 10];
+    let (mut at, mut li) = (start, first);
+    let mut line: Vec<u8> = vec![];
+    let size = f.metadata().map_or(0, |m| m.len());
+    let take = |li: usize, line: &[u8], out: &mut String, last: bool| -> bool {
+        if li >= l0 {
+            let t = line_text(line);
+            if let Some((a, b, nl)) = sel.on_line(li, t.len()) {
+                out.push_str(t.get(a..b).unwrap_or(""));
+                if nl && !last {
+                    out.push('\n');
+                }
+            }
+        }
+        li >= l1 || out.len() >= max
+    };
+    loop {
+        let got = f.read_at(&mut buf, at).unwrap_or(0);
+        if got == 0 {
+            if !line.is_empty() {
+                take(li, &line, &mut out, true);
+            }
+            break;
+        }
+        at += got as u64;
+        let mut rest = &buf[..got];
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            if line.len() < LINE_CAP {
+                line.extend_from_slice(&rest[..i.min(LINE_CAP - line.len())]);
+            }
+            let end = at - (rest.len() - i - 1) as u64 >= size;
+            if take(li, &line, &mut out, end) {
+                let cut = out.len() >= max && li < l1 && !end;
+                out.truncate(out.floor_char_boundary(max));
+                return (out, cut);
+            }
+            line.clear();
+            li += 1;
+            rest = &rest[i + 1..];
+        }
+        if line.len() < LINE_CAP {
+            line.extend_from_slice(&rest[..rest.len().min(LINE_CAP - line.len())]);
+        }
+    }
+    let cut = out.len() > max;
+    out.truncate(out.floor_char_boundary(max));
+    (out, cut)
 }
 
 /// A line as shown: tabs as spaces, a CR at its end dropped, cut at the cap.

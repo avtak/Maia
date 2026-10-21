@@ -129,14 +129,33 @@ pub fn rotate(t: &Tools, prog: &str, path: &Path, right: bool, again: bool) -> R
 
 /// The latest copy of `path` in the trash.
 pub(crate) fn newest_trashed(path: &Path) -> Option<crate::trashcan::Item> {
-    crate::trashcan::list().into_iter().filter(|it| it.original == path).max_by(|a, b| a.deleted.cmp(&b.deleted).then_with(|| a.file.cmp(&b.file)))
+    newest_trashed_by(path, None)
+}
+
+/// The latest copy of `path` the trash took by `by`, when given. Deletion dates count
+/// seconds: two versions trashed in one (an archive changed twice quickly) are told
+/// apart by when each was moved there, its inode's change time.
+pub(crate) fn newest_trashed_by(path: &Path, by: Option<std::time::SystemTime>) -> Option<crate::trashcan::Item> {
+    let moved = |it: &crate::trashcan::Item| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(&it.file).ok().map(|m| std::time::UNIX_EPOCH + std::time::Duration::new(m.ctime().max(0) as u64, m.ctime_nsec().clamp(0, 999_999_999) as u32))
+    };
+    crate::trashcan::list()
+        .into_iter()
+        .filter(|it| it.original == path && by.is_none_or(|by| moved(it).is_none_or(|m| m <= by)))
+        .max_by(|a, b| a.deleted.cmp(&b.deleted).then_with(|| moved(a).cmp(&moved(b))).then_with(|| a.file.cmp(&b.file)))
 }
 
 /// Undo a turn: the turned picture to the trash, the original back from it.
 pub fn undo_replaced(paths: &[PathBuf]) -> usize {
+    undo_replaced_by(paths, None)
+}
+
+/// `undo_replaced`, with the version the trash took by `by`.
+pub fn undo_replaced_by(paths: &[PathBuf], by: Option<std::time::SystemTime>) -> usize {
     let mut errs = 0;
     for p in paths {
-        let Some(it) = newest_trashed(p) else {
+        let Some(it) = newest_trashed_by(p, by) else {
             errs += 1;
             continue;
         };

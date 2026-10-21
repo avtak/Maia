@@ -25,6 +25,8 @@ pub struct Entry {
     pub created: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
     pub mode: u32,
+    /// The owner's user id (`u32::MAX` when unknown).
+    pub uid: u32,
     /// Byte offset of the extension inside `lname()` (its length when there is none).
     ext_at: u16,
     /// For flattened search results: byte offset in `path` where the part relative to the
@@ -65,6 +67,7 @@ impl Entry {
             created: meta.created().ok(),
             accessed: meta.accessed().ok(),
             mode: meta.permissions().mode(),
+            uid: std::os::unix::fs::MetadataExt::uid(&meta),
             ext_at: 0,
             rel_at: 0,
             depth: 0,
@@ -75,7 +78,7 @@ impl Entry {
 
     /// A row for something that isn't a file (an unmounted drive).
     pub fn placeholder(path: PathBuf, name: String, is_dir: bool) -> Entry {
-        let mut e = Entry { name: String::new(), lower: None, path, is_dir, is_link: false, special: false, hidden: false, size: 0, modified: None, created: None, accessed: None, mode: 0, ext_at: 0, rel_at: 0, depth: 0 };
+        let mut e = Entry { name: String::new(), lower: None, path, is_dir, is_link: false, special: false, hidden: false, size: 0, modified: None, created: None, accessed: None, mode: 0, uid: u32::MAX, ext_at: 0, rel_at: 0, depth: 0 };
         e.set_name(name);
         e
     }

@@ -276,7 +276,7 @@ pub fn cancelled_label(label: &str) -> String {
 }
 
 fn job_title(label: &str, failed: bool) -> String {
-    for (now, done, verb) in [("Copying", "Copied", "copy"), ("Moving", "Moved", "move"), ("Deleting", "Deleted", "delete"), ("Extracting", "Extracted", "extract"), ("Compressing", "Compressed", "compress"), ("Converting", "Converted", "convert"), ("Merging", "Merged", "merge"), ("Splitting", "Split", "split"), ("Tidying", "Tidied", "tidy")] {
+    for (now, done, verb) in [("Copying", "Copied", "copy"), ("Moving", "Moved", "move"), ("Deleting", "Deleted", "delete"), ("Extracting", "Extracted", "extract"), ("Compressing", "Compressed", "compress"), ("Converting", "Converted", "convert"), ("Merging", "Merged", "merge"), ("Splitting", "Split", "split"), ("Tidying", "Tidied", "tidy"), ("Renaming", "Renamed", "rename"), ("Creating", "Created", "create")] {
         if let Some(rest) = label.strip_prefix(now) {
             return if failed { format!("Couldn't {verb}{rest}") } else { format!("{done}{rest}") };
         }
@@ -287,7 +287,7 @@ fn job_title(label: &str, failed: bool) -> String {
 /// What Undo takes back, from the job's title: "Moving notes.txt to the trash" is
 /// "Move notes.txt to the trash".
 pub fn job_undo_label(label: &str) -> String {
-    for (now, verb) in [("Copying", "Copy"), ("Moving", "Move"), ("Deleting", "Delete"), ("Extracting", "Extract"), ("Compressing", "Compress"), ("Converting", "Convert"), ("Merging", "Merge"), ("Splitting", "Split"), ("Tidying", "Tidy")] {
+    for (now, verb) in [("Copying", "Copy"), ("Moving", "Move"), ("Deleting", "Delete"), ("Extracting", "Extract"), ("Compressing", "Compress"), ("Converting", "Convert"), ("Merging", "Merge"), ("Splitting", "Split"), ("Tidying", "Tidy"), ("Renaming", "Rename"), ("Creating", "Create")] {
         if let Some(rest) = label.strip_prefix(now) {
             return format!("{verb}{rest}");
         }
@@ -332,6 +332,15 @@ impl App {
         self.drop_right = matches!(self.drag, Some(Drag::Files { right: true, .. }));
         let ctx = ctx.clone();
         let pal = self.pal;
+        // ------------------------------------------------ the picker's bar (Open and Save)
+        // The window's whole width, under the sidebar too: a dialog's row of answers.
+        if self.picker.is_some() {
+            egui::TopBottomPanel::bottom("picker")
+                .exact_height(crate::picker::height(self))
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.fill(pal.chrome))
+                .show(&ctx, |ui| crate::picker::bar(self, ui));
+        }
         // ------------------------------------------------ sidebar (full height)
         if self.sidebar {
             // A narrow window keeps room beside it for the title bar's window buttons and
@@ -819,10 +828,11 @@ impl App {
     fn panel_ui(&mut self, ui: &mut Ui, id: u64, rect: Rect, tabs_in_title: bool) {
         let pal = self.pal;
         let is_active = id == self.active;
-        // Focus on any press inside.
+        // Focus on any press inside, but not one on a job card or anything else floating
+        // over it.
         if ui.input(|i| i.pointer.any_pressed()) {
             if let Some(pp) = ui.ctx().pointer_interact_pos() {
-                if rect.contains(pp) && !is_active && matches!(self.popup, Popup::None) {
+                if rect.contains(pp) && !is_active && matches!(self.popup, Popup::None) && ui.ctx().layer_id_at(pp).is_none_or(|l| l == ui.layer_id()) {
                     self.actions.push(Action::FocusPanel(id));
                 }
             }
@@ -1214,7 +1224,8 @@ impl App {
             0
         };
         let zoom = t.settings.zoom;
-        let view_name = listing::view_name(zoom);
+        let view_name = listing::view_label(&t.settings);
+        let view_mode = listing::mode_of(&t.settings);
         let error = t.error.clone();
         let (show_folders, show_files) = (t.settings.show_folders, t.settings.show_files);
         let mut toggle_folders = false;
@@ -1243,8 +1254,9 @@ impl App {
                 ui.painter().galley(pos2(r.left() + 6.0 + iw, r.center().y - g.size().y / 2.0), g, col);
                 if tip.is_empty() { resp } else { resp.on_hover_text(tip) }
             };
-            // Zoom chip with a fill bar proportional to the zoom.
-            let zr = chip(ui, None, &format!("{}%", (zoom * 100.0 + 1e-3).floor() as i32), pal.text_dim, false, "View size (Ctrl+wheel)");
+            // Zoom chip with a fill bar proportional to the zoom (none in Columns, which has
+            // no zoom).
+            let zr = if view_mode == listing::Mode::Columns { ui.allocate_exact_size(Vec2::ZERO, Sense::hover()).1 } else { chip(ui, None, &format!("{}%", (zoom * 100.0 + 1e-3).floor() as i32), pal.text_dim, false, "View size (Ctrl+wheel)") };
             if zr.rect.width() > 10.0 {
                 let bar = Rect::from_min_max(pos2(zr.rect.left() + 5.0, zr.rect.bottom() - 4.0), pos2(zr.rect.right() - 5.0, zr.rect.bottom() - 2.5));
                 ui.painter().rect_filled(bar, CornerRadius::same(1), pal.border);
@@ -1253,7 +1265,7 @@ impl App {
             if zr.clicked() {
                 self.popup = Popup::zoom(id, zr.rect.right_top());
             }
-            let view_icon = move |p: &egui::Painter, r: Rect| listing::paint_view_glyph(p, r, listing::mode_for(zoom), pal.text_dim);
+            let view_icon = move |p: &egui::Painter, r: Rect| listing::paint_view_glyph(p, r, view_mode, pal.text_dim);
             let vr = chip(ui, Some(&view_icon), view_name, pal.text_dim, false, "Change view");
             if vr.clicked() {
                 self.popup = Popup::zoom(id, vr.rect.right_top());
@@ -1402,25 +1414,17 @@ impl App {
         let hint = if t.content.on { if fw < 150.0 { "Find…".into() } else { "Find in files…".into() } } else { hint };
         let before = t.filter.clone();
         let mut fui = ui.new_child(UiBuilder::new().max_rect(edit_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        // Conditions the filter understands (size>10M, modified<7d) show in the accent.
-        let (accent, text) = (pal.accent, pal.text);
-        let mut conds = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-            let s = buf.as_str();
-            let font = egui::TextStyle::Body.resolve(ui.style());
-            let fmt = |c: Color32| egui::TextFormat { font_id: font.clone(), color: c, ..Default::default() };
-            let mut job = egui::text::LayoutJob::default();
-            let mut at = 0;
-            for (a, b) in crate::query::parse(s, std::time::SystemTime::now()).spans {
-                job.append(&s[at..a], 0.0, fmt(text));
-                job.append(&s[a..b], 0.0, fmt(accent));
-                at = b;
-            }
-            job.append(&s[at..], 0.0, fmt(text));
-            job.wrap.max_width = wrap;
+        // Conditions and operators the filter understands (size>10M, -draft, a | b) show
+        // in the accent, a broken pattern in the danger colour.
+        let (accent, text, danger) = (pal.accent, pal.text, pal.danger);
+        // One line that scrolls, as egui lays out a single-line field itself: a long
+        // query wrapped onto a second line below the box.
+        let mut conds = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+            let job = crate::query::job(buf.as_str(), egui::TextStyle::Body.resolve(ui.style()), text, accent, danger);
             ui.fonts_mut(|f| f.layout_job(job))
         };
         let mut edit = egui::TextEdit::singleline(&mut t.filter).hint_text(egui::RichText::new(hint).color(pal.text_dim)).frame(false).margin(egui::Margin::symmetric(4, 0)).desired_width(edit_rect.width()).font(egui::TextStyle::Body);
-        if before.contains(['>', '<', '=', ':']) {
+        if crate::query::marked(&before) {
             edit = edit.layouter(&mut conds);
         }
         let resp = fui.add(edit);
@@ -1633,8 +1637,10 @@ impl App {
                 for (k, j) in self.jobs.iter_mut().enumerate() {
                     egui::Frame::popup(ui.style()).fill(pal.raised).corner_radius(CornerRadius::same(10)).inner_margin(10.0).show(ui, |ui| {
                         ui.set_width(320.0);
-                        let p = j.progress.lock().unwrap();
+                        let mut p = j.progress.lock().unwrap();
                         let done = p.finished;
+                        // Its disk is busy with another job: it starts when that one ends.
+                        let waiting = if done { None } else { p.waiting.clone() };
                         let failed = done && !p.errors.is_empty() && p.errors.len() >= p.total_items.max(1);
                         let cancelled = j.cancel.load(std::sync::atomic::Ordering::Relaxed);
                         // The title gets what the buttons leave and ends in "…" past it: a
@@ -1647,6 +1653,19 @@ impl App {
                             if done {
                                 if ui.small_button("×").clicked() {
                                     remove = Some(k);
+                                }
+                            } else if waiting.is_some() {
+                                let c = ui.small_button("Cancel");
+                                note_control(ui, c.rect, "job cancel");
+                                if c.clicked() {
+                                    j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    self.queue.poke();
+                                }
+                                let b = ui.small_button("Start now");
+                                note_control(ui, b.rect, "job start now");
+                                if b.clicked() {
+                                    p.go = true;
+                                    self.queue.poke();
                                 }
                             } else {
                                 if ui.small_button("Cancel").clicked() {
@@ -1669,9 +1688,11 @@ impl App {
                             _ => 0.0,
                         };
                         ui.add(egui::ProgressBar::new(if done && !cancelled { 1.0 } else { frac }).desired_height(5.0).fill(if p.errors.is_empty() { pal.accent } else { pal.danger }));
-                        let el = j.started.elapsed().as_secs_f64().max(0.001);
+                        let el = p.since.unwrap_or(j.started).elapsed().as_secs_f64().max(0.001);
                         let mut line = format!("{} / {} item{}", p.done_items, p.total_items, if p.total_items == 1 { "" } else { "s" });
-                        if p.within.is_some() && !done {
+                        if let Some(w) = &waiting {
+                            line = format!("Waiting for “{w}”");
+                        } else if p.within.is_some() && !done {
                             line.push_str(&format!(" · {:.0}%", frac * 100.0));
                         } else if p.total_bytes > 0 {
                             let speed = p.done_bytes as f64 / el;
@@ -1681,7 +1702,12 @@ impl App {
                                 line.push_str(&format!(" · {} left", time_left(eta)));
                             }
                         }
-                        ui.label(egui::RichText::new(line).small().color(pal.text_dim));
+                        if waiting.is_some() {
+                            // The other job's title can be any length: one line, cut with "…".
+                            ui.add(egui::Label::new(egui::RichText::new(line).small().color(pal.text_dim)).truncate());
+                        } else {
+                            ui.label(egui::RichText::new(line).small().color(pal.text_dim));
+                        }
                         if !done && !p.current.is_empty() {
                             // One line, cut with "…": a long name wrapped and the card grew and
                             // shrank from file to file.

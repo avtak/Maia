@@ -84,7 +84,12 @@ pub struct Probe {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// The film's codec when there is a film, else the sound's.
     pub codec: String,
+    /// The sound's codec.
+    pub acodec: String,
+    /// When the container says it was made (its creation_time).
+    pub created: Option<std::time::SystemTime>,
 }
 
 /// `ffprobe -of flat` output (key="value" lines; no JSON parser needed).
@@ -107,6 +112,7 @@ pub fn parse_probe(flat: &[u8]) -> Option<Probe> {
     p.title = tag("title");
     p.artist = tag("artist");
     p.album = tag("album");
+    p.created = tag("creation_time").and_then(|t| crate::facts::parse_utc(&t));
     for i in 0.. {
         let s = |f: &str| get(&format!("streams.stream.{i}.{f}"));
         let Some(kind) = s("codec_type") else { break };
@@ -123,6 +129,9 @@ pub fn parse_probe(flat: &[u8]) -> Option<Probe> {
             }
             "audio" => {
                 p.audio = true;
+                if p.acodec.is_empty() {
+                    p.acodec = codec.clone();
+                }
                 if p.codec.is_empty() {
                     p.codec = codec;
                 }

@@ -62,6 +62,8 @@ pub struct Tree {
     pub focus: bool,
     reveal: bool,
     pub note: Option<String>,
+    /// Text selected across rows: (node, byte of its row as shown).
+    pub tsel: Option<crate::textsel::Sel>,
 }
 
 // ---------------------------------------------------------------- JSON
@@ -772,7 +774,7 @@ pub fn flatten(v: &V, note: Option<String>) -> Tree {
     // Small files open whole; big ones show their first two levels.
     let all = nodes.len() <= 400;
     let open = nodes.iter().map(|n| all || n.depth < 1).collect();
-    let mut t = Tree { nodes, open, rows: vec![], rows_ok: false, sel: 0, focus: false, reveal: false, note };
+    let mut t = Tree { nodes, open, rows: vec![], rows_ok: false, sel: 0, focus: false, reveal: false, note, tsel: None };
     t.rebuild();
     t
 }
@@ -884,6 +886,96 @@ impl Tree {
     }
 }
 
+/// What a row shows, piece by piece, for its colours.
+#[derive(Clone, Copy)]
+enum Part {
+    Key,
+    Count,
+    Value(K),
+}
+
+/// A row's text in pieces: the key, then the value or what a folded map or list holds.
+fn parts(n: &Node, open: bool) -> Vec<(std::borrow::Cow<'_, str>, Part)> {
+    use std::borrow::Cow;
+    let mut v = vec![];
+    if !n.key.is_empty() || !n.index {
+        let k = if n.index { Cow::Borrowed(n.key.as_str()) } else if n.key.is_empty() || n.key.contains([' ', ':', '"']) { Cow::Owned(quote(&n.key)) } else { Cow::Borrowed(n.key.as_str()) };
+        v.push((k, Part::Key));
+        v.push((Cow::Borrowed(if matches!(n.kind, K::Map | K::List) { "" } else { ": " }), Part::Key));
+    }
+    match n.kind {
+        K::Map | K::List => {
+            let (o, c) = if n.kind == K::Map { ("{", "}") } else { ("[", "]") };
+            if n.count == 0 {
+                v.push((Cow::Owned(format!("  {o}{c}")), Part::Key));
+            } else if !open {
+                v.push((Cow::Owned(format!("  {o}…{c} ")), Part::Key));
+                v.push((Cow::Owned(count_text(n)), Part::Count));
+            }
+        }
+        k => v.push((Cow::Borrowed(n.text.as_str()), Part::Value(k))),
+    }
+    v
+}
+
+/// A string value as shown, without its quotes. Its escapes stay: the shown form does
+/// not mark a backslash that was there, so `\n` could be either.
+fn unquote(s: &str) -> String {
+    s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(s).to_string()
+}
+
+impl Tree {
+    /// Row `ni`'s text as drawn, and where its value starts (a scalar's).
+    pub fn row_text(&self, ni: usize) -> (String, Option<usize>) {
+        let Some(n) = self.nodes.get(ni) else { return (String::new(), None) };
+        let mut s = String::new();
+        let mut value = None;
+        for (t, part) in parts(n, self.open[ni]) {
+            if matches!(part, Part::Value(_)) {
+                value = Some(s.len());
+            }
+            s.push_str(&t);
+        }
+        (s, value)
+    }
+
+    /// What Copy takes: the text selected across rows (each row after the first indented
+    /// as it is drawn), else the value of the row picked: a string without its quotes, a
+    /// map or list as its rows.
+    pub fn copy_text(&self) -> String {
+        let rows = &self.rows;
+        let sel = match self.tsel.filter(|s| !s.is_empty()) {
+            Some(s) => s,
+            None if self.focus => match self.nodes.get(self.sel) {
+                Some(n) if !matches!(n.kind, K::Map | K::List) => return if n.kind == K::Str { unquote(&n.text) } else { n.text.clone() },
+                Some(n) => crate::textsel::Sel::new((self.sel, 0), ((n.end as usize).saturating_sub(1), usize::MAX)),
+                None => return String::new(),
+            },
+            None => return String::new(),
+        };
+        let ((n0, _), (n1, _)) = sel.span();
+        let start = rows.partition_point(|&r| (r as usize) < n0);
+        let base = rows.get(start).and_then(|&r| self.nodes.get(r as usize)).map_or(0, |n| n.depth);
+        let mut out = String::new();
+        let mut k = start;
+        while let Some(&r) = rows.get(k).filter(|&&r| (r as usize) <= n1) {
+            let ni = r as usize;
+            let (text, _) = self.row_text(ni);
+            if let Some((a, b, nl)) = sel.on_line(ni, text.len()) {
+                if a == 0 && k > start {
+                    out.push_str(&"  ".repeat(self.nodes[ni].depth.saturating_sub(base) as usize));
+                }
+                out.push_str(text.get(a..b).unwrap_or(""));
+                if nl && rows.get(k + 1).is_some_and(|&x| (x as usize) <= n1) {
+                    out.push('\n');
+                }
+            }
+            k += 1;
+        }
+        out
+    }
+}
+
 fn count_text(n: &Node) -> String {
     match (n.kind, n.count) {
         (K::Map, 1) => "1 key".into(),
@@ -918,7 +1010,47 @@ pub fn view(ui: &mut Ui, body: Rect, t: &mut Tree, size: f32, pal: &Palette, spa
             let n = &t.nodes[r as usize];
             n.depth as f32 * indent + (n.key.chars().count() + n.text.chars().count().min(200) + 14) as f32 * cw
         }).fold(0.0, f32::max);
-        let (r, resp) = ui.allocate_exact_size(vec2((widest + 24.0).max(vp.width()), n_rows as f32 * row_h + 4.0), Sense::click());
+        let (r, resp) = ui.allocate_exact_size(vec2((widest + 24.0).max(vp.width()), n_rows as f32 * row_h + 4.0), Sense::click_and_drag());
+        // Text across rows: the place under a point is a node and a byte of its row.
+        let text_x = |ni: usize| r.left() + 4.0 + t.nodes[ni].depth as f32 * indent + indent + 2.0;
+        if !t.rows.is_empty() {
+            let rows = &t.rows;
+            let tree = &*t;
+            let hit = |pp: egui::Pos2| -> crate::textsel::At {
+                let y = pp.y - r.top();
+                if y < 0.0 {
+                    return (rows[0] as usize, 0);
+                }
+                let i = (y / row_h) as usize;
+                let Some(&ni) = rows.get(i) else {
+                    let last = rows[rows.len() - 1] as usize;
+                    return (last, tree.row_text(last).0.len());
+                };
+                let ni = ni as usize;
+                (ni, crate::textsel::byte_at_col(&tree.row_text(ni).0, (pp.x - text_x(ni)) / cw.max(1.0)))
+            };
+            // A double-click on a value takes all of it (a string without its quotes).
+            let word = |(ni, b): crate::textsel::At| {
+                let (text, value) = tree.row_text(ni);
+                let (x, y) = match value.filter(|&v| b >= v) {
+                    Some(v) if tree.nodes[ni].kind == K::Str && text.len() >= v + 2 => (v + 1, text.len() - 1),
+                    Some(v) => (v, text.len()),
+                    None => crate::textsel::word(&text, b),
+                };
+                ((ni, x), (ni, y))
+            };
+            let line = |(ni, _): crate::textsel::At| {
+                let k = rows.partition_point(|&x| (x as usize) < ni);
+                match rows.get(k + 1) {
+                    Some(&next) => ((ni, 0), (next as usize, 0)),
+                    None => ((ni, 0), (ni, tree.row_text(ni).0.len())),
+                }
+            };
+            let mut ts = t.tsel;
+            crate::textsel::track(ui, &resp, &mut ts, hit, word, line);
+            t.tsel = ts;
+        }
+        let tsel = t.tsel.filter(|s| !s.is_empty());
         let first = (vp.min.y / row_h).floor().max(0.0) as usize;
         let last = ((vp.max.y / row_h).ceil() as usize + 1).min(n_rows);
         let p = ui.painter();
@@ -935,12 +1067,15 @@ pub fn view(ui: &mut Ui, body: Rect, t: &mut Tree, size: f32, pal: &Palette, spa
             let ni = ni as usize;
             let n = &t.nodes[ni];
             let row = Rect::from_min_max(pos2(r.left() + vp.min.x, y), pos2(r.left() + vp.max.x, y + row_h));
+            // While text is selected the row picked shows as it does without the
+            // keyboard, so the selection reads over it.
+            let lit = t.focus && tsel.is_none();
             if ni == t.sel {
-                p.rect_filled(row, CornerRadius::same(3), if t.focus { pal.selected } else { pal.hover });
+                p.rect_filled(row, CornerRadius::same(3), if lit { pal.selected } else { pal.hover });
             } else if hover.is_some_and(|h| row.contains(h)) {
                 p.rect_filled(row, CornerRadius::same(3), pal.hover.gamma_multiply(0.6));
             }
-            let on_sel = ni == t.sel && t.focus;
+            let on_sel = ni == t.sel && lit;
             let dim = if on_sel { pal.on_sel_dim() } else { pal.text_dim };
             let x0 = r.left() + 4.0 + n.depth as f32 * indent;
             let chev = Rect::from_min_size(pos2(x0, y), vec2(indent, row_h));
@@ -951,11 +1086,6 @@ pub fn view(ui: &mut Ui, body: Rect, t: &mut Tree, size: f32, pal: &Palette, spa
             }
             let mut job = egui::text::LayoutJob::default();
             let fmt = |c| egui::TextFormat { font_id: font.clone(), color: c, ..Default::default() };
-            if !n.key.is_empty() || !n.index {
-                let k = if n.index { n.key.clone() } else if n.key.is_empty() || n.key.contains([' ', ':', '"']) { quote(&n.key) } else { n.key.clone() };
-                job.append(&k, 0.0, fmt(dim));
-                job.append(if matches!(n.kind, K::Map | K::List) { "" } else { ": " }, 0.0, fmt(dim));
-            }
             let s = &pal.syntax;
             let value_col = |k: K| match k {
                 K::Str => s.string,
@@ -964,18 +1094,20 @@ pub fn view(ui: &mut Ui, body: Rect, t: &mut Tree, size: f32, pal: &Palette, spa
                 K::Date => s.kind,
                 _ => pal.text,
             };
-            match n.kind {
-                K::Map | K::List => {
-                    let open_sym = if n.kind == K::Map { "{" } else { "[" };
-                    let close_sym = if n.kind == K::Map { "}" } else { "]" };
-                    if n.count == 0 {
-                        job.append(&format!("  {open_sym}{close_sym}"), 0.0, fmt(dim));
-                    } else if !t.open[ni] {
-                        job.append(&format!("  {open_sym}…{close_sym} "), 0.0, fmt(dim));
-                        job.append(&count_text(n), 0.0, fmt(dim.gamma_multiply(0.8)));
-                    }
+            for (text, part) in parts(n, t.open[ni]) {
+                let c = match part {
+                    Part::Key => dim,
+                    Part::Count => dim.gamma_multiply(0.8),
+                    Part::Value(k) => if on_sel { pal.on_sel() } else { value_col(k) },
+                };
+                job.append(&text, 0.0, fmt(c));
+            }
+            if let Some((a, b, nl)) = tsel.and_then(|s| s.on_line(ni, job.text.len())) {
+                let x0 = chev.right() + 2.0 + crate::textsel::cols(&job.text, 0, a) * cw;
+                let x1 = chev.right() + 2.0 + crate::textsel::cols(&job.text, 0, b) * cw + if nl { cw * 0.6 } else { 0.0 };
+                if x1 > x0 {
+                    crate::textsel::paint(p, Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h)), pal);
                 }
-                k => job.append(&n.text, 0.0, fmt(if on_sel { pal.on_sel() } else { value_col(k) })),
             }
             let g = ui.fonts_mut(|f| f.layout_job(job));
             p.galley(pos2(chev.right() + 2.0, y + lift), g, pal.text);

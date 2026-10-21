@@ -16,6 +16,8 @@
 !/assets/*.ttf
 !/assets/*.txt
 !/assets/*.svg
+# The app icon: a blur the SVG renderer cannot draw.
+!/assets/maia.png
 # The tour's films: built into the binary, made by tools/tour-media.sh.
 !/assets/tour/
 !/assets/tour/*.webp

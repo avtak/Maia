@@ -120,6 +120,12 @@ impl MimeDb {
         "application/octet-stream".into()
     }
 
+    /// Whether a file of this name has a type of its own ("Makefile"), whatever its
+    /// extension: its label is not its extension's.
+    pub fn named(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
     /// The Type column label: "Folder", the MIME description, "<EXT> File" for unknown
     /// extensions, or "File" without one. Cached per extension.
     pub fn label(&self, name: &str, ext: &str, is_dir: bool, exec: bool) -> String {

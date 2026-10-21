@@ -1738,19 +1738,42 @@ fn window_icon_is_the_launcher_icon() {
     let (px, w, h) = crate::install::window_icon();
     assert_eq!((w, h), (64, 64));
     let at = |x: u32, y: u32| &px[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
-    assert_eq!(at(0, 0)[3], 0, "rounded corner");
-    assert!(at(32, 60)[3] == 255 && at(32, 60)[0] < 40, "dark tile");
-    // The star's centre (82, 46 of 128) is white, and its glow is blue.
-    let c = at(41, 23);
-    assert!(c[0] > 240 && c[1] > 240 && c[2] > 240, "star {c:?}");
-    let g = at(41, 31);
-    assert!(g[2] > g[0], "blue glow under the star {g:?}");
+    assert_eq!(at(0, 0)[3], 0, "clear around the folder");
+    assert_eq!(at(32, 2)[3], 0, "clear above the papers");
+    // The front paper, nearly white, stands out of the folder.
+    let paper = at(16, 15);
+    assert!(paper[3] > 250 && paper[0] > 200 && paper[0].abs_diff(paper[2]) < 12, "paper {paper:?}");
+    // The foot of the glass front is near black.
+    let glass = at(32, 51);
+    assert!(glass[3] > 240 && glass[0] < 60, "glass {glass:?}");
     if let Some(d) = std::env::var_os("MAIA_ICON_DUMP") {
         let f = std::fs::File::create(std::path::Path::new(&d).join("window-icon.png")).unwrap();
         let mut e = png::Encoder::new(f, w, h);
         e.set_color(png::ColorType::Rgba);
         e.write_header().unwrap().write_image_data(&px).unwrap();
     }
+}
+
+#[test]
+fn installing_the_icon_replaces_the_old_svg() {
+    use crate::install::{ICON_PNG, icon_in, old_icon_in, place_icon};
+    let d = tmpdir("hicolor");
+    // What an install of 0.4 left behind.
+    touch(&old_icon_in(&d), "<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+    assert!(place_icon(&d).unwrap());
+    assert!(!old_icon_in(&d).exists(), "a scalable icon would still be picked first");
+    assert_eq!(std::fs::read(icon_in(&d)).unwrap(), ICON_PNG);
+    let png = crate::imgdec::decode_bytes(&std::fs::read(icon_in(&d)).unwrap()).unwrap();
+    assert_eq!((png.w, png.h), (256, 256), "the size its folder names");
+    // An up-to-date icon is left alone, so starting Maia doesn't make launchers reload it.
+    let t = std::fs::metadata(icon_in(&d)).unwrap().modified().unwrap();
+    assert!(!place_icon(&d).unwrap());
+    assert_eq!(std::fs::metadata(icon_in(&d)).unwrap().modified().unwrap(), t);
+    // An older PNG is rewritten.
+    std::fs::write(icon_in(&d), b"old").unwrap();
+    assert!(place_icon(&d).unwrap());
+    assert_eq!(std::fs::read(icon_in(&d)).unwrap(), ICON_PNG);
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]
@@ -2345,6 +2368,141 @@ fn filter_conditions_by_size_and_date() {
     let f = crate::query::parse("big size>10M  modified<7d x", now);
     assert_eq!(f.spans, vec![(4, 12), (14, 25)]);
     assert_eq!(f.name, "big x");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn filter_language_or_not_types_patterns_owners() {
+    use std::fs::{File, FileTimes};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::SystemTime;
+    let d = tmpdir("filterlang");
+    let now = SystemTime::now();
+    let day = Duration::from_secs(86_400);
+    // name, bytes, modified and accessed this many days ago
+    let files = [
+        ("report-2026.pdf", 3 << 20, 2, 400),
+        ("report-draft.md", 1000, 0, 0),
+        ("notes.txt", 10, 40, 1),
+        ("IMG_0001.jpg", 500 << 10, 3, 3),
+        ("IMG_0002.png", 400 << 10, 3, 3),
+        ("photo (1).jpg", 2000, 5, 5),
+        ("my-file.txt", 20, 5, 5),
+        ("archive.tar.gz", 5000, 5, 5),
+        ("theirs.txt", 30, 5, 5),
+    ];
+    for (name, n, m, a) in files {
+        let f = File::create(d.join(name)).unwrap();
+        f.set_len(n).unwrap();
+        f.set_times(FileTimes::new().set_modified(now - day * m).set_accessed(now - day * a)).unwrap();
+    }
+    std::fs::create_dir_all(d.join("Projects/src")).unwrap();
+    touch(&d.join("Projects/src/main.rs"), "fn main() {}");
+    // Another user's file, where this user may give it away (root in the sandbox).
+    let me = std::fs::metadata(d.join("notes.txt")).unwrap().uid();
+    let given = std::os::unix::fs::chown(d.join("theirs.txt"), Some(65534), None).is_ok();
+    let tagged = crate::tags::write(&d.join("notes.txt"), &["work".into()]).is_ok();
+    let users = crate::query::users(true).unwrap();
+    let stats = HashMap::new();
+    let mut t = Tab::new(78, d.clone(), ViewSettings::default(), egui::Context::default());
+    pump(&mut t, &stats);
+    let ctx = egui::Context::default();
+    let shown = |t: &mut Tab, f: &str| -> Vec<String> {
+        t.filter = f.into();
+        let start = Instant::now();
+        loop {
+            pump(t, &stats);
+            crate::tags::flush(&ctx);
+            if !t.entries.iter().any(|e| crate::tags::get(&e.path, |_| ()).is_none()) || start.elapsed() > Duration::from_secs(5) {
+                pump(t, &stats);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut v: Vec<String> = t.view.iter().map(|&i| t.entries[i as usize].name.clone()).collect();
+        v.sort();
+        v
+    };
+    // Last access, as kept by the filesystem (read before anything opens the files).
+    assert_eq!(shown(&mut t, "accessed>1y"), ["report-2026.pdf"]);
+    assert_eq!(shown(&mut t, "accessed<2d ext:txt,md"), ["notes.txt", "report-draft.md"]);
+    // Either, written three ways.
+    for q in ["ext:pdf | ext:md", "ext:pdf OR ext:md", "ext:pdf,md", "ext:pdf|ext:md"] {
+        assert_eq!(shown(&mut t, q), ["report-2026.pdf", "report-draft.md"], "{q}");
+    }
+    // A lowercase "or" is a word, as it always was: one fuzzy search of every word.
+    assert_eq!(shown(&mut t, "report or draft"), Vec::<String>::new());
+    // Not: a word after it is matched as typed, a condition is turned around.
+    for q in ["report -draft", "report !draft", "report NOT draft"] {
+        assert_eq!(shown(&mut t, q), ["report-2026.pdf"], "{q}");
+    }
+    assert_eq!(shown(&mut t, "ext:md,pdf -ext:pdf"), ["report-draft.md"]);
+    assert_eq!(shown(&mut t, "-size<1k -type:folder"), ["IMG_0001.jpg", "IMG_0002.png", "archive.tar.gz", "photo (1).jpg", "report-2026.pdf"]);
+    // A hyphen inside a word is part of it; a lone one is a word too.
+    assert_eq!(shown(&mut t, "my-file"), ["my-file.txt"]);
+    assert_eq!(shown(&mut t, "-"), ["my-file.txt", "report-2026.pdf", "report-draft.md"]);
+    // Kinds, the smart folders' and the type's own description.
+    assert_eq!(shown(&mut t, "type:pictures"), ["IMG_0001.jpg", "IMG_0002.png", "photo (1).jpg"]);
+    assert_eq!(shown(&mut t, "kind:pdfs,archives"), ["archive.tar.gz", "report-2026.pdf"]);
+    assert_eq!(shown(&mut t, "type:folder"), ["Projects"]);
+    assert_eq!(shown(&mut t, "type:png"), ["IMG_0002.png"], "Filter By Type's label");
+    // Endings: several, with or without the dot, two-part ones.
+    assert_eq!(shown(&mut t, "ext:.GZ"), ["archive.tar.gz"]);
+    assert_eq!(shown(&mut t, "ext:tar.gz,jpg"), ["IMG_0001.jpg", "archive.tar.gz", "photo (1).jpg"]);
+    // Patterns: regular expressions on the name, globs, name:, phrases.
+    assert_eq!(shown(&mut t, r"/^img_\d+\.(jpg|png)$/"), ["IMG_0001.jpg", "IMG_0002.png"]);
+    assert_eq!(shown(&mut t, "re:^report|notes"), ["notes.txt", "report-2026.pdf", "report-draft.md"]);
+    assert_eq!(shown(&mut t, "/(?-i)^img/"), Vec::<String>::new(), "case when asked for");
+    assert_eq!(shown(&mut t, "*.jpg"), ["IMG_0001.jpg", "photo (1).jpg"]);
+    assert_eq!(shown(&mut t, "name:img_*"), ["IMG_0001.jpg", "IMG_0002.png"]);
+    assert_eq!(shown(&mut t, r#"name:"photo (1)""#), ["photo (1).jpg"]);
+    assert_eq!(shown(&mut t, r#""to (1""#), ["photo (1).jpg"], "a phrase, its quote left open while typing");
+    // A broken pattern matches nothing and is marked; an unclosed one is a word.
+    assert_eq!(shown(&mut t, "/img_(/"), Vec::<String>::new());
+    let f = crate::query::parse("/img_(/ x", now);
+    assert_eq!((f.bad.clone(), f.spans.clone()), (vec![(0, 7)], vec![]));
+    assert_eq!(crate::query::parse("/usr/lib", now).spans, vec![]);
+    // Groups, in a query with an OR; without one "(1)" is part of the name as before.
+    assert_eq!(shown(&mut t, "(type:pictures | ext:pdf) size>450k"), ["IMG_0001.jpg", "report-2026.pdf"]);
+    assert_eq!(shown(&mut t, "-(type:pictures | ext:pdf) size>1k"), ["archive.tar.gz"]);
+    assert_eq!(shown(&mut t, "photo (1)"), ["photo (1).jpg"]);
+    // Everything that matched the words before still ranks first.
+    t.filter = "report | ext:jpg".into();
+    pump(&mut t, &stats);
+    let order: Vec<&str> = t.view.iter().map(|&i| t.entries[i as usize].name.as_str()).collect();
+    assert_eq!(order.len(), 4);
+    assert!(order[..2].iter().all(|n| n.starts_with("report")), "{order:?}");
+    // Owners, by name or number.
+    let name = users.iter().find(|u| u.0 == me).map(|u| u.1.clone()).unwrap_or_else(|| me.to_string());
+    let mine = shown(&mut t, &format!("owner:{name}"));
+    if given {
+        assert!(!mine.contains(&"theirs.txt".to_string()) && mine.len() == 9, "{mine:?}");
+        assert_eq!(shown(&mut t, "owner:65534"), ["theirs.txt"]);
+        assert_eq!(shown(&mut t, &format!("-owner:{name}")), ["theirs.txt"]);
+    } else {
+        eprintln!("files can't be given away here: owners of others skipped");
+        assert_eq!(mine.len(), 10);
+    }
+    assert_eq!(shown(&mut t, "owner:no-such-user-here"), Vec::<String>::new());
+    // Tags with the rest.
+    if tagged {
+        assert_eq!(shown(&mut t, "tag:work | ext:pdf"), ["notes.txt", "report-2026.pdf"]);
+        assert_eq!(shown(&mut t, "ext:txt -tag:work"), ["my-file.txt", "theirs.txt"]);
+    } else {
+        eprintln!("no user xattrs here: tags skipped");
+    }
+    // In a flattened listing words and NOT see the path below the folder.
+    t.set_flatten(true);
+    assert_eq!(shown(&mut t, "ext:rs"), ["main.rs"]);
+    assert_eq!(shown(&mut t, "ext:rs -src"), Vec::<String>::new());
+    assert_eq!(shown(&mut t, "ext:rs | report -draft"), ["main.rs", "report-2026.pdf"]);
+    // Marked in the accent: the operators and what is not a plain word.
+    let f = crate::query::parse("report -draft | type:pdf", now);
+    assert_eq!(f.spans, vec![(7, 8), (8, 13), (14, 15), (16, 24)]);
+    assert_eq!(f.name, "report");
+    assert_eq!(crate::query::name_part("report -draft"), "report");
+    assert_eq!(crate::query::name_part("my-file"), "my-file");
+    assert_eq!(crate::query::name_part(r#"todo "two words" ext:rs"#), "todo two words");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -3664,9 +3822,11 @@ fn every_option_has_one_section() {
         Opt::PictureViewer => 61,
         Opt::Tour => 62,
         Opt::CustomActions => 63,
+        Opt::CheckCopies => 64,
+        Opt::Picker => 65,
     };
-    let numbered: Vec<usize> = (0..59).chain([61, 62, 63]).collect();
-    let mut seen = vec![0; 64];
+    let numbered: Vec<usize> = (0..59).chain([61, 62, 63, 64, 65]).collect();
+    let mut seen = vec![0; 66];
     for o in OPTS {
         seen[index(o.0)] += 1;
     }
@@ -3711,6 +3871,7 @@ fn option_search_spans_sections() {
     for (q, o) in [
         ("color scheme", Opt::Theme),
         ("default file manager", Opt::DefaultFm),
+        ("open and save dialog", Opt::Picker),
         ("search by meaning", Opt::Meaning),
         ("reuse the open window", Opt::SingleInstance),
         ("show github pictures", Opt::GitPictures),
@@ -4028,6 +4189,46 @@ fn a_broken_link_is_not_executable() {
 
 /// How long Search Code takes over a big tree (MAIA_BENCH_DIR, else /usr/include), warm,
 /// for plain text, whole words and expressions that match little, so all of it is read.
+/// How long the filter takes over a flattened tree of about 350,000 files (a real folder,
+/// /usr by default, repeated until it is that big), for plain words and for long queries.
+/// `cargo test --release filter_query_speed -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn filter_query_speed() {
+    let dir = PathBuf::from(std::env::var("MAIA_BENCH_DIR").unwrap_or_else(|_| "/usr".into()));
+    let _ = crate::query::users(true);
+    let w = crate::fsx::walk_async(dir.clone(), true, egui::Context::default());
+    let mut found = vec![];
+    while !w.done.load(std::sync::atomic::Ordering::Relaxed) {
+        found.extend(w.rx.try_iter().flatten());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    found.extend(w.rx.try_iter().flatten());
+    let mut entries = Vec::with_capacity(360_000);
+    while entries.len() < 350_000 && !found.is_empty() {
+        entries.extend(found.iter().cloned());
+    }
+    let stats = HashMap::new();
+    let recents = HashSet::new();
+    let ctx = ViewCtx { show_hidden: true, show_system: true, folders_first: true, recents_on_top: false, recents: &recents, stats: &stats };
+    let mut t = Tab::new(42, dir, ViewSettings::default(), egui::Context::default());
+    t.flatten = true;
+    t.set_entries(entries);
+    let queries = std::env::var("MAIA_BENCH_QUERIES").unwrap_or_else(|_| ";lib;lib size>10k;lib modified<1y size>1k;lib -test ext:so,h,py;(lib | share) -doc type:code,pictures size>1k;/^lib.*\\.so(\\.\\d+)*$/;re:^[a-m] -ext:gz,png modified>30d owner:root;type:png;*.h -name:config".into());
+    // Queries are split at ';' (`|` is the filter's own).
+    for q in queries.split(';') {
+        t.filter = q.to_string();
+        let mut ms = vec![];
+        for _ in 0..9 {
+            let t0 = Instant::now();
+            t.rebuild(&ctx);
+            ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.total_cmp(b));
+        eprintln!("{:>7.1} ms least {:>7.1} median  {:>7} of {} shown  {q:?}", ms[0], ms[4], t.view.len(), t.entries.len());
+    }
+}
+
 #[test]
 #[ignore]
 fn code_search_speed() {
@@ -6818,7 +7019,7 @@ fn ports_and_their_owners() {
 /// later version doesn't stop it loading.
 #[test]
 fn smart_folders_find_what_they_say() {
-    use crate::smart::{SmartFolder, glob, parse_bytes, search};
+    use crate::smart::{SmartFolder, glob, search};
     let d = tmpdir("smart");
     let old = std::time::SystemTime::now() - Duration::from_secs(86_400 * 90);
     let file = |p: &str, len: usize, aged: bool| {
@@ -6851,7 +7052,7 @@ fn smart_folders_find_what_they_say() {
         v.sort();
         v
     };
-    let sf = |has: &str, kinds: &[&str], days: Option<u32>, bigger: Option<u64>| SmartFolder { id: 1, name: "x".into(), root: d.clone(), name_has: has.into(), kinds: kinds.iter().map(|k| k.to_string()).collect(), days, bigger };
+    let sf = |has: &str, kinds: &[&str], days: Option<u32>, bigger: Option<u64>| SmartFolder { id: 1, name: "x".into(), root: d.clone(), name_has: has.into(), kinds: kinds.iter().map(|k| k.to_string()).collect(), days, bigger, ..Default::default() };
     assert_eq!(found(&sf("invoice", &[], None, None)), ["Invoices/2025/invoice-001.pdf", "Invoices/2026/Invoice-030.PDF", "Invoices/2026/invoice-031.pdf"], "any case; no folders, hidden, installed or linked copies");
     assert_eq!(found(&sf("invoice-0??.pdf", &[], None, None)), ["Invoices/2025/invoice-001.pdf", "Invoices/2026/Invoice-030.PDF", "Invoices/2026/invoice-031.pdf"]);
     assert_eq!(found(&sf("IMG_*", &[], None, None)), ["Photos/IMG_0001.jpg", "Photos/IMG_0002.png"]);
@@ -6863,25 +7064,41 @@ fn smart_folders_find_what_they_say() {
     assert!(glob(&"a*b?c".chars().collect::<Vec<_>>(), &"axxbyc".chars().collect::<Vec<_>>()));
     assert!(!glob(&"a*b?c".chars().collect::<Vec<_>>(), &"axxbc".chars().collect::<Vec<_>>()));
     assert!(glob(&"*".chars().collect::<Vec<_>>(), &[]));
-    // From a search in the filter.
-    let from = crate::smart::from_filter(&d, "invoice size>1M modified<30d");
-    assert_eq!((from.name.as_str(), from.name_has.as_str(), from.bigger, from.days), ("invoice", "invoice", Some(1 << 20), Some(30)));
+    // From a search in the filter: all of it.
+    let from = crate::smart::from_filter(&d, " invoice size>1M modified<30d ");
+    assert_eq!((from.name.as_str(), from.query.as_str()), ("invoice", "invoice size>1M modified<30d"));
     assert_eq!(found(&from), ["Invoices/2026/invoice-031.pdf"]);
     assert_eq!(crate::smart::from_filter(&d.join("Photos"), "size>=2k").name, "Photos");
-    assert_eq!(parse_bytes("10 MB"), Some(10 << 20));
-    assert_eq!(parse_bytes("1.5G"), Some(1_610_612_736));
-    assert_eq!(parse_bytes("500k"), Some(512_000));
-    assert_eq!(parse_bytes("lots"), None);
-    // The dialog's fields.
-    let crate::popups::Popup::SmartEdit(mut e) = crate::smart::edit(&sf("invoice", &["pdfs"], Some(30), Some(10 << 20)), true) else { panic!() };
-    assert_eq!((e.days.as_str(), e.bigger.as_str()), ("30", "10.0 MB"));
-    assert_eq!(e.build().unwrap(), SmartFolder { name: "x".into(), ..sf("invoice", &["pdfs"], Some(30), Some(10 << 20)) });
-    e.days = "soon".into();
-    assert!(e.build().unwrap_err().starts_with("Days"));
-    e.days.clear();
-    e.bigger = "big".into();
-    assert!(e.build().unwrap_err().starts_with("Size"));
-    e.bigger.clear();
+    // The whole language, tested by the filter's own code.
+    let q = |text: &str| SmartFolder { id: 2, name: "q".into(), root: d.clone(), query: text.into(), ..Default::default() };
+    assert_eq!(found(&q("ext:pdf -invoice-001")), ["Invoices/2026/Invoice-030.PDF", "Invoices/2026/invoice-031.pdf"]);
+    assert_eq!(found(&q("type:pictures | size>5M")), ["Photos/IMG_0001.jpg", "Photos/IMG_0002.png", "Photos/holiday.mp4"]);
+    assert_eq!(found(&q(r"/^img_\d+\.jpg$/ | (ext:txt notes)")), ["Invoices/notes.txt", "Photos/IMG_0001.jpg"]);
+    assert_eq!(found(&q("2026 ext:pdf")), ["Invoices/2026/Invoice-030.PDF", "Invoices/2026/invoice-031.pdf"], "words see the path below the folder");
+    let me = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(d.join("Invoices/notes.txt")).unwrap());
+    assert_eq!(found(&q(&format!("owner:{me} ext:txt"))), ["Invoices/notes.txt"]);
+    if crate::tags::write(&d.join("Photos/IMG_0002.png"), &["keep".into()]).is_ok() {
+        assert_eq!(found(&q("tag:keep | ext:mp4")), ["Photos/IMG_0002.png", "Photos/holiday.mp4"], "tags read from the files");
+    }
+    // An older smart folder's fields, translated into the query they amount to: the
+    // same files as above, and what the dialog shows.
+    let old = sf("invoice", &["pdfs", "holograms"], Some(30), Some(1 << 20));
+    assert_eq!(old.query_text(), "name:invoice type:pdfs modified<30d size>1M");
+    assert_eq!(found(&old), ["Invoices/2026/invoice-031.pdf"]);
+    assert_eq!(sf("IMG_*", &[], None, Some(1500)).query_text(), "name:IMG_* size>1500");
+    assert_eq!(SmartFolder { query: "a | b".into(), ..sf("my scan", &[], Some(2), None) }.query_text(), r#"name:"my scan" modified<2d (a | b)"#);
+    assert_eq!(sf("", &[], None, Some(1_000_000)).query_text(), "size>1000000");
+    assert!(old.summary().ends_with("“name:invoice type:pdfs modified<30d size>1M”"), "{}", old.summary());
+    // The dialog's fields: what it saves is the query alone.
+    let crate::popups::Popup::SmartEdit(mut e) = crate::smart::edit(&old, true) else { panic!() };
+    assert_eq!(e.query, "name:invoice type:pdfs modified<30d size>1M");
+    let saved = e.build().unwrap();
+    assert_eq!(saved, SmartFolder { id: 1, name: "x".into(), root: d.clone(), query: e.query.clone(), ..Default::default() });
+    assert_eq!(found(&saved), found(&old));
+    e.query = "invoice /(/".into();
+    assert_eq!(e.build().unwrap_err(), "Find: /(/ is not a regular expression");
+    e.query = "  ".into();
+    assert_eq!(e.build().unwrap().query, "", "every file is a smart folder too");
     e.root = d.join("nowhere").display().to_string();
     assert!(e.build().unwrap_err().starts_with("There is no folder"));
     e.root = d.display().to_string();
@@ -6891,6 +7108,7 @@ fn smart_folders_find_what_they_say() {
     let path = d.join("userdata.json");
     let mut ud = crate::config::UserData::with_defaults();
     ud.smart.push(sf("invoice", &["pdfs"], Some(30), None));
+    ud.smart.push(q("ext:pdf | tag:keep"));
     crate::config::save_json(&path, &ud).unwrap();
     let back: crate::config::UserData = crate::config::load_json(&path);
     assert_eq!(back.smart, ud.smart);
@@ -8557,6 +8775,38 @@ fn big_files_page_and_search() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The find bar stays inside the body it is given. A terminal pane squeezed by a small
+/// window has a body shorter than the bar, which once reached up over the panel's
+/// status bar.
+#[test]
+fn find_bar_stays_inside_its_body() {
+    use crate::findbar::{Finder, bar};
+    let pal = crate::theme::palette(crate::theme::ThemeName::default());
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx, "", "");
+    // Shapes painted beyond the panel's own background, and the room left below the bar.
+    let mut run = |body: Option<egui::Rect>| {
+        let mut f = Finder::new("main".into());
+        let mut rest = egui::Rect::NOTHING;
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(body) = body {
+                    rest = bar(ui, body, &mut f, "1 of 2", true, 7, false, &pal).1;
+                }
+            });
+        });
+        (rest, out.shapes.len())
+    };
+    let (_, empty) = run(None);
+    let tall = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(400.0, 200.0));
+    let (rest, n) = run(Some(tall));
+    assert!(rest.bottom() < tall.bottom() - 20.0 && n > empty, "a tall body gives the bar its room: {rest:?}");
+    let short = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(400.0, 18.0));
+    let (rest, n) = run(Some(short));
+    assert_eq!(rest, short, "a short body keeps all of itself");
+    assert_eq!(n, empty, "and nothing of the bar is drawn");
+}
+
 /// Find in a preview: case ignored unless the query has capitals, matches stepped through
 /// in a ring, and the place kept when more text arrives.
 #[test]
@@ -8877,6 +9127,210 @@ fn terminal_pty_round_trip() {
     let p = Pty::spawn(sh, 40, 5, ctx).unwrap();
     p.resize(33, 7);
     wait(&p, &|s| s.row_text(0) == "7 33");
+}
+
+/// Hyperlinks as `ls --hyperlink=always` writes them: each name links to its file, the
+/// spaces between don't; a link written with an id and a BEL, cut by what is written
+/// over it, and kept on its text when the line is rewrapped.
+#[test]
+fn terminal_hyperlinks() {
+    let d = tmpdir("vt-links");
+    touch(&d.join("a b.txt"), "x");
+    touch(&d.join("notes.md"), "y");
+    let out = std::process::Command::new("ls").args(["--hyperlink=always", "--color=never", "-1"]).current_dir(&d).output().unwrap();
+    assert!(out.status.success() && out.stdout.starts_with(b"\x1b]8;;file://"), "{:?}", String::from_utf8_lossy(&out.stdout));
+    // The terminal's line discipline turns its line feeds into CR LF.
+    let bytes: Vec<u8> = out.stdout.iter().flat_map(|&b| if b == b'\n' { vec![b'\r', b'\n'] } else { vec![b] }).collect();
+    let t = vt(40, 4, &bytes);
+    assert_eq!(vt_rows(&t)[..2], ["a b.txt", "notes.md"]);
+    let row = |y| t.screen.line(t.screen.view_line(y)).unwrap();
+    let path = |y, x| row(y).link(x).and_then(|u| crate::termlink::file_uri(u));
+    assert_eq!(path(0, 0), Some(d.join("a b.txt").display().to_string()));
+    assert_eq!(path(0, 6), path(0, 0), "the whole name");
+    assert_eq!(path(1, 3), Some(d.join("notes.md").display().to_string()));
+    assert!(row(0).link(7).is_none() && row(1).link(8).is_none(), "nothing after the name");
+    let mut t = vt(10, 3, b"go \x1b]8;id=x1;https://example.com/a;b\x07here and\x1b]8;;\x07 on");
+    let link = |t: &crate::vt::Term, n: u64, x: usize| t.screen.line(n).and_then(|r| r.link(x)).map(|u| u.to_string());
+    assert_eq!(link(&t, 0, 3).as_deref(), Some("https://example.com/a;b"));
+    // "go here an" + "d on": it runs on to the next row, and stops.
+    assert_eq!((link(&t, 0, 2), link(&t, 1, 0).as_deref(), link(&t, 1, 1)), (None, Some("https://example.com/a;b"), None));
+    // Wider, the line is one row and the link still on "here and".
+    t.screen.resize(20, 3);
+    assert_eq!(vt_rows(&t)[0], "go here and on");
+    let n = t.screen.view_line(0);
+    assert_eq!((3..11).filter(|&x| link(&t, n, x).is_some()).count(), 8);
+    assert!(link(&t, n, 2).is_none() && link(&t, n, 11).is_none());
+    // Plain text written over part of it unlinks that part only.
+    t.feed(b"\x1b[1;4HHE");
+    assert_eq!((link(&t, n, 3), link(&t, n, 4), link(&t, n, 5).is_some()), (None, None, true));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Mouse reports in each of xterm's modes and encodings, modifiers included.
+#[test]
+fn terminal_mouse_reports() {
+    use crate::vt::Mouse::*;
+    let none = (false, false, false);
+    let mut t = vt(300, 5, b"");
+    assert_eq!(t.screen.report(Press(0), 2, 3, none), None, "not asked for");
+    // less --mouse and vim with mouse=a ask for these.
+    t.feed(b"\x1b[?1006;1000h");
+    let s = |t: &crate::vt::Term, e, x, y, m| t.screen.report(e, x, y, m).map(|b| String::from_utf8_lossy(&b).into_owned());
+    assert_eq!(s(&t, Press(0), 2, 3, none).as_deref(), Some("\x1b[<0;3;4M"));
+    assert_eq!(s(&t, Release(2), 2, 3, none).as_deref(), Some("\x1b[<2;3;4m"));
+    assert_eq!(s(&t, Wheel(true), 0, 0, (false, false, true)).as_deref(), Some("\x1b[<80;1;1M"));
+    assert_eq!(s(&t, Wheel(false), 0, 0, (true, true, false)).as_deref(), Some("\x1b[<77;1;1M"));
+    assert_eq!(s(&t, Motion(Some(0)), 4, 0, none), None, "1000 is clicks only");
+    t.feed(b"\x1b[?1002h");
+    assert_eq!(s(&t, Motion(Some(0)), 4, 0, none).as_deref(), Some("\x1b[<32;5;1M"));
+    assert_eq!(s(&t, Motion(None), 4, 0, none), None, "1002 is drags only");
+    t.feed(b"\x1b[?1003h");
+    assert_eq!(s(&t, Motion(None), 4, 0, none).as_deref(), Some("\x1b[<35;5;1M"));
+    // xterm's own bytes, which can't say a column past 223.
+    t.feed(b"\x1b[?1006l");
+    assert_eq!(t.screen.report(Press(2), 2, 3, (true, false, false)), Some(vec![0x1b, b'[', b'M', 32 + 2 + 4, 32 + 3, 32 + 4]));
+    assert_eq!(t.screen.report(Release(2), 2, 3, none), Some(vec![0x1b, b'[', b'M', 32 + 3, 32 + 3, 32 + 4]));
+    assert_eq!(t.screen.report(Press(0), 250, 0, none), None);
+    t.feed(b"\x1b[?1015h");
+    assert_eq!(s(&t, Press(1), 2, 3, none).as_deref(), Some("\x1b[33;3;4M"));
+    t.feed(b"\x1b[?1015l\x1b[?1005h");
+    assert_eq!(s(&t, Press(0), 250, 0, none), Some(format!("\x1b[M {}!", char::from_u32(32 + 251).unwrap())));
+    // X10's own mode: presses only, no modifiers.
+    t.feed(b"\x1b[?1005l\x1b[?9h");
+    assert_eq!(t.screen.report(Press(0), 0, 0, (false, false, true)), Some(b"\x1b[M !!".to_vec()));
+    assert_eq!(t.screen.report(Release(0), 0, 0, none), None);
+    t.feed(b"\x1b[?9l");
+    assert_eq!(t.screen.report(Press(0), 0, 0, none), None);
+}
+
+/// Real programs asking for the mouse get it: less scrolls with the wheel, and a click
+/// puts vim's cursor where it was.
+#[test]
+fn terminal_mouse_with_real_programs() {
+    use crate::terminal::Pty;
+    use crate::vt::Mouse::*;
+    use std::process::Command;
+    let wait = |p: &Pty, what: &str, ok: &dyn Fn(&crate::vt::Screen) -> bool| {
+        let t0 = Instant::now();
+        while !ok(&p.shared.term().screen) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{what}: {:?}", vt_rows(&p.shared.term()));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let d = tmpdir("vt-mouse");
+    let file = d.join("lines.txt");
+    touch(&file, &(1..=200).map(|i| format!("line {i}\n")).collect::<String>());
+    let ctx = egui::Context::default();
+    let none = (false, false, false);
+    if crate::media::have("less") {
+        let mut c = Command::new("less");
+        c.arg("--mouse").arg(&file).env("LESSHISTFILE", "-");
+        let mut p = Pty::spawn(c, 40, 10, ctx.clone()).unwrap();
+        wait(&p, "less", &|s| s.mouse == crate::vt::Track::Click && s.mouse_enc == crate::vt::Enc::Sgr && s.row_text(0) == "line 1");
+        let down = p.shared.term().screen.report(Wheel(false), 5, 5, none).unwrap();
+        p.write(&down.repeat(3));
+        wait(&p, "less scrolled down", &|s| s.row_text(0) != "line 1");
+        let up = p.shared.term().screen.report(Wheel(true), 5, 5, none).unwrap();
+        p.write(&up.repeat(10));
+        wait(&p, "less scrolled back", &|s| s.row_text(0) == "line 1");
+        p.write(b"q");
+        wait(&p, "less let the mouse go", &|s| s.mouse == crate::vt::Track::Off && !s.alt());
+    }
+    if crate::media::have("vim") {
+        let mut c = Command::new("vim");
+        c.args(["-u", "NONE", "-i", "NONE", "-n", "-N", "-c", "set mouse=a"]).arg(&file);
+        let mut p = Pty::spawn(c, 40, 10, ctx).unwrap();
+        wait(&p, "vim", &|s| s.mouse == crate::vt::Track::Drag && s.row_text(0) == "line 1");
+        let (press, release) = {
+            let t = p.shared.term();
+            (t.screen.report(Press(0), 2, 5, none).unwrap(), t.screen.report(Release(0), 2, 5, none).unwrap())
+        };
+        p.write(&press);
+        p.write(&release);
+        std::thread::sleep(Duration::from_millis(100));
+        p.write(b"iX\x1b");
+        wait(&p, "the X where vim was clicked", &|s| s.row_text(5) == "liXne 6");
+        p.write(b":q!\r");
+        wait(&p, "vim let the mouse go", &|s| s.mouse == crate::vt::Track::Off);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Find goes through the scrollback and the screen, a line that ran on as one; a
+/// double click takes a word (a path with its line number whole), a triple the line.
+#[test]
+fn terminal_finds_and_selects() {
+    let mut t = vt(10, 3, b"alpha one\r\n123456 Beta\r\nsee ~/src/main.rs:12, ok\r\n");
+    for i in 0..20 {
+        t.feed(format!("{i} beta\r\n").as_bytes());
+    }
+    let s = &t.screen;
+    assert!(s.history() > 5);
+    let mut hits = vec![];
+    s.find("beta", false, 100, &mut hits);
+    assert_eq!(hits.len(), 21);
+    let first = s.dropped;
+    // "123456 Bet" + "a": the match runs over the edge.
+    assert_eq!(hits[0], ((first + 1, 7), (first + 2, 0)));
+    assert_eq!(s.text(hits[0].0, hits[0].1), "Beta");
+    s.find("Beta", true, 100, &mut hits);
+    assert_eq!(hits.len(), 1, "upper case matches case");
+    s.find("beta", false, 5, &mut hits);
+    assert_eq!(hits.len(), 5);
+    s.find("zzz", false, 100, &mut hits);
+    assert!(hits.is_empty());
+    let word = |p: (u64, usize)| s.word(p).map(|(a, b)| s.text(a, b));
+    assert_eq!(word((first + 2, 0)).as_deref(), Some("Beta"), "a word over the edge");
+    // "see ~/src/" "main.rs:12" ", ok"
+    assert_eq!(word((first + 4, 2)).as_deref(), Some("~/src/main.rs:12"));
+    assert_eq!(s.word((first + 1, 6)), Some(((first + 1, 6), (first + 1, 6))), "a blank, alone");
+    assert_eq!(word((first + 5, 0)).as_deref(), Some(","));
+    // A word ending a sentence leaves its full stop, unless the full stop was clicked.
+    let t2 = vt(30, 2, b"read ~/notes.md. then a.b, c?");
+    let s2 = &t2.screen;
+    let n2 = s2.view_line(0);
+    let word2 = |x| s2.word((n2, x)).map(|(a, b)| s2.text(a, b));
+    assert_eq!((word2(6).as_deref(), word2(15).as_deref()), (Some("~/notes.md"), Some("~/notes.md.")));
+    assert_eq!((word2(22).as_deref(), word2(27).as_deref()), (Some("a.b"), Some("c")));
+    let (a, b) = s.line_span(first + 4);
+    assert_eq!(s.text(a, b), "see ~/src/main.rs:12, ok");
+}
+
+/// Addresses and paths in a line, as compilers, grep and people write them.
+#[test]
+fn terminal_links_in_text() {
+    use crate::termlink::{Target, at, resolve};
+    let find = |l: &str, w: &str| {
+        let i = l[..l.find(w).unwrap()].chars().count();
+        at(l, i).map(|(a, b, t)| (l.chars().skip(a).take(b - a).collect::<String>(), t))
+    };
+    let url = |s: &str| Target::Url(s.into());
+    let path = |s: &str, line, col| Target::Path { text: s.into(), line, col };
+    assert_eq!(find("see https://example.com/a_(b). done", "example"), Some(("https://example.com/a_(b)".into(), url("https://example.com/a_(b)"))));
+    assert_eq!(find("(at https://x.org/y),", "x.org"), Some(("https://x.org/y".into(), url("https://x.org/y"))));
+    assert_eq!(find("<http://localhost:8080/>", "local"), Some(("http://localhost:8080/".into(), url("http://localhost:8080/"))));
+    assert_eq!(find("error: src/main.rs:12:5: oops", "src"), Some(("src/main.rs:12:5".into(), path("src/main.rs", Some(12), Some(5)))));
+    assert_eq!(find("  --> src/vt.rs:42", "vt"), Some(("src/vt.rs:42".into(), path("src/vt.rs", Some(42), None))));
+    // grep -n and grep -n --column: the match after the numbers is not part of it.
+    assert_eq!(find("notes.txt:7:some match", "notes"), Some(("notes.txt:7".into(), path("notes.txt", Some(7), None))));
+    assert_eq!(find("notes.txt:7:3:some match", "notes"), Some(("notes.txt:7:3".into(), path("notes.txt", Some(7), Some(3)))));
+    assert_eq!(find("notes.txt:7:some match", "some"), None);
+    assert_eq!(find("see host:8080x", "host"), Some(("host:8080x".into(), path("host:8080x", None, None))));
+    assert_eq!(find("cc --out=build/app.o", "build"), Some(("build/app.o".into(), path("build/app.o", None, None))));
+    assert_eq!(find("open ~/notes.md.", "~"), Some(("~/notes.md".into(), path("~/notes.md", None, None))));
+    assert_eq!(find("'/tmp/a b'", "/tmp"), Some(("/tmp/a".into(), path("/tmp/a", None, None))));
+    assert_eq!(find("file:///tmp/a%20b", "file"), Some(("file:///tmp/a%20b".into(), path("/tmp/a b", None, None))));
+    assert_eq!(at("a  b", 1), None);
+    assert_eq!(at("...", 1), None);
+    let d = tmpdir("vt-paths");
+    touch(&d.join("sub/file.rs"), "fn main() {}\n");
+    assert_eq!(resolve("sub/file.rs", Some(&d)), Some((d.join("sub/file.rs"), false)));
+    assert_eq!(resolve("./sub/../sub", Some(&d)), Some((d.join("sub"), true)));
+    assert_eq!(resolve(&d.join("sub").display().to_string(), None), Some((d.join("sub"), true)));
+    assert_eq!(resolve("missing.rs", Some(&d)), None);
+    assert_eq!(resolve("sub/file.rs", None), None, "relative without a folder to be in");
+    assert_eq!(resolve("~", None), Some((crate::fsx::home(), true)));
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Conflicts settled as "if newer" (replaced only by a newer file, else skipped) and by
@@ -9257,6 +9711,2501 @@ fn a_dropped_watch_lets_go_of_its_descriptor() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(fds(), before, "both closed, with or without a folder watched");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+
+// ---------------------------------------------------------------- queue, check, redo
+
+/// A second folder on another file system than the temp folder (/dev/shm, a tmpfs), for
+/// moves across disks; None where there is none.
+fn other_fs(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let shm = Path::new("/dev/shm");
+    let t = std::fs::metadata(std::env::temp_dir()).ok()?.dev();
+    if std::fs::metadata(shm).ok()?.dev() == t {
+        return None;
+    }
+    let d = shm.join(format!("maia-test-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).ok()?;
+    Some(d)
+}
+
+/// What was put in a trash from under `dir`, removed for good.
+fn purge_trashed_under(dir: &Path) {
+    for it in crate::trashcan::list().into_iter().filter(|it| it.original.starts_with(dir)) {
+        let _ = crate::trashcan::purge(&it);
+    }
+}
+
+fn app_frame(app: &mut crate::app::App, ctx: &egui::Context) {
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
+    let _ = ctx.run(raw, |c| app.frame(c));
+}
+
+fn app_until(app: &mut crate::app::App, ctx: &egui::Context, what: &str, ok: impl Fn(&crate::app::App) -> bool) {
+    let t0 = Instant::now();
+    while !ok(app) {
+        assert!(t0.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+        app_frame(app, ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Partitions of one drive, a btrfs subvolume (a device of its own, 0:N, named only by
+/// its mount's source), LUKS on a partition and LVM on that are all the one disk; a stick
+/// is another; tmpfs and a FUSE mount are each their own. The sysfs is laid out as the
+/// kernel lays it out, the mount table as /proc/self/mountinfo reads on such a laptop.
+#[test]
+fn disks_are_named_by_the_drive_under_them() {
+    use std::os::unix::fs::symlink;
+    let d = tmpdir("disks");
+    let sys = d.join("sys");
+    let nvme = sys.join("devices/pci0000:00/0000:00:06.0/nvme/nvme0/nvme0n1");
+    let sda = sys.join("devices/pci0000:00/0000:00:14.0/usb2/2-1/host0/block/sda");
+    for (dir, part) in [(&nvme, "nvme0n1p1"), (&nvme, "nvme0n1p2"), (&nvme, "nvme0n1p3"), (&sda, "sda1")] {
+        touch(&dir.join(part).join("partition"), "1\n");
+    }
+    let dm0 = sys.join("devices/virtual/block/dm-0");
+    let dm1 = sys.join("devices/virtual/block/dm-1");
+    std::fs::create_dir_all(dm0.join("slaves")).unwrap();
+    std::fs::create_dir_all(dm1.join("slaves")).unwrap();
+    std::fs::create_dir_all(sys.join("class/block")).unwrap();
+    std::fs::create_dir_all(sys.join("dev/block")).unwrap();
+    let class = |n: &str, to: &Path| symlink(to, sys.join("class/block").join(n)).unwrap();
+    class("nvme0n1", &nvme);
+    class("nvme0n1p1", &nvme.join("nvme0n1p1"));
+    class("nvme0n1p2", &nvme.join("nvme0n1p2"));
+    class("nvme0n1p3", &nvme.join("nvme0n1p3"));
+    class("sda", &sda);
+    class("sda1", &sda.join("sda1"));
+    class("dm-0", &dm0);
+    class("dm-1", &dm1);
+    // LUKS on the third partition, LVM inside it.
+    symlink(nvme.join("nvme0n1p3"), dm0.join("slaves/nvme0n1p3")).unwrap();
+    symlink(&dm0, dm1.join("slaves/dm-0")).unwrap();
+    for (dev, to) in [("259:1", nvme.join("nvme0n1p1")), ("259:3", nvme.join("nvme0n1p3")), ("254:0", dm0.clone()), ("254:1", dm1.clone()), ("8:1", sda.join("sda1"))] {
+        symlink(to, sys.join("dev/block").join(dev)).unwrap();
+    }
+    let mountinfo = "\
+26 1 0:33 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw,ssd,space_cache=v2,subvolid=256,subvol=/@
+45 26 0:34 /@home /home rw,relatime shared:28 - btrfs /dev/nvme0n1p2 rw,ssd,space_cache=v2,subvolid=257,subvol=/@home
+48 26 259:1 / /boot rw,relatime shared:31 - vfat /dev/nvme0n1p1 rw,fmask=0137,dmask=0027
+50 26 254:1 / /srv rw,relatime shared:33 - ext4 /dev/mapper/vg-srv rw
+27 26 0:25 / /tmp rw,nosuid,nodev shared:14 - tmpfs tmpfs rw,size=16195776k
+98 30 0:50 / /run/user/1000/gvfs rw,nosuid,nodev,relatime shared:244 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000,group_id=1000
+101 26 8:1 / /run/media/me/STICK rw,nosuid,nodev,relatime shared:250 - vfat /dev/sda1 rw,uid=1000
+";
+    let key = |dev| ops::disk_key(dev, &sys, mountinfo);
+    for dev in [(0, 33), (0, 34), (259, 1), (259, 3), (254, 0), (254, 1)] {
+        assert_eq!(key(dev), "nvme0n1", "{dev:?} is on the laptop's drive");
+    }
+    assert_eq!(key((8, 1)), "sda", "the stick");
+    assert_eq!(key((0, 25)), "0:25", "tmpfs is no disk");
+    assert_eq!(key((0, 50)), "0:50", "nor is a FUSE mount");
+    assert_eq!(key((0, 99)), "0:99", "a device in no mount");
+    // This machine, as it is: one file system is one disk, another file system can be.
+    let a = ops::disk_of(&d).unwrap();
+    assert_eq!(ops::disk_of(&d.join("not yet/made")).as_deref(), Some(a.as_str()), "a path still to be made is on its folder's disk");
+    assert_eq!(ops::disk_of(&std::env::temp_dir()).as_deref(), Some(a.as_str()));
+    if let Some(shm) = other_fs("disks") {
+        assert_ne!(ops::disk_of(&shm).unwrap(), a);
+        let _ = std::fs::remove_dir_all(&shm);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Copies onto one disk wait for each other, first come first served, each card saying
+/// what it waits for; a job told to start now and one on another disk don't wait; a
+/// move within one file system (a rename) never queues; a waiting job cancelled ends
+/// without copying anything.
+#[test]
+fn jobs_on_one_disk_take_turns() {
+    let ctx = egui::Context::default();
+    let q = std::sync::Arc::new(ops::Queue::default());
+    let d = tmpdir("queue");
+    let big: Vec<u8> = (0..24_000_000u32).map(|i| (i * 13 % 251) as u8).collect();
+    std::fs::write(d.join("big.bin"), &big).unwrap();
+    touch(&d.join("small.txt"), "small");
+    touch(&d.join("moved.txt"), "moved");
+    for o in ["out1", "out2", "out4", "out5", "elsewhere"] {
+        std::fs::create_dir_all(d.join(o)).unwrap();
+    }
+    let copy = |id: u64, what: &str, to: &str| ops::spawn_in(id, OpKind::Copy { srcs: vec![d.join(what)], dest: d.join(to), decide: HashMap::new() }, ctx.clone(), &q, false);
+    let first = copy(1, "big.bin", "out1");
+    first.pause.store(true, std::sync::atomic::Ordering::Relaxed);
+    let t0 = Instant::now();
+    while q.running() != [1] {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the first job holds the disk");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let second = copy(2, "small.txt", "out2");
+    let waits_for = |j: &ops::Job, label: &str| {
+        let t0 = Instant::now();
+        while j.progress.lock().unwrap().waiting.as_deref() != Some(label) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{} waiting for {label}: {:?}", j.label, j.progress.lock().unwrap().waiting);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    waits_for(&second, "Copying big.bin");
+    // A rename on the same disk goes ahead.
+    let mv = ops::spawn_in(3, OpKind::Move { srcs: vec![d.join("moved.txt")], dest: d.join("elsewhere"), decide: HashMap::new() }, ctx.clone(), &q, false);
+    wait_job(&mv);
+    assert!(d.join("elsewhere/moved.txt").exists());
+    // Told to start now, it does, while the first still holds the disk.
+    let third = copy(4, "small.txt", "out4");
+    waits_for(&third, "Copying big.bin");
+    third.progress.lock().unwrap().go = true;
+    q.poke();
+    wait_job(&third);
+    assert!(d.join("out4/small.txt").exists() && third.progress.lock().unwrap().since.is_some());
+    // Cancelled while it waits: done, nothing copied.
+    let fourth = copy(5, "small.txt", "out5");
+    waits_for(&fourth, "Copying big.bin");
+    fourth.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    q.poke();
+    wait_job(&fourth);
+    assert!(!d.join("out5/small.txt").exists(), "a cancelled job in the queue copies nothing");
+    // Another disk is another queue.
+    if let Some(shm) = other_fs("queue") {
+        touch(&shm.join("there.txt"), "there");
+        std::fs::create_dir_all(shm.join("out")).unwrap();
+        let other = ops::spawn_in(6, OpKind::Copy { srcs: vec![shm.join("there.txt")], dest: shm.join("out"), decide: HashMap::new() }, ctx.clone(), &q, false);
+        wait_job(&other);
+        assert!(shm.join("out/there.txt").exists(), "a copy on another disk runs beside the first");
+        let _ = std::fs::remove_dir_all(&shm);
+    }
+    assert!(!d.join("out2/small.txt").exists() && !second.progress.lock().unwrap().finished, "the second still waits");
+    first.pause.store(false, std::sync::atomic::Ordering::Relaxed);
+    wait_job(&first);
+    wait_job(&second);
+    assert_eq!(std::fs::read(d.join("out1/big.bin")).unwrap(), big);
+    assert!(d.join("out2/small.txt").exists(), "its turn came once the first was done");
+    assert!(q.running().is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// With Check Copies on, every copied file is read back from the disk and compared with
+/// what went in: a good copy is read twice over (its bytes count twice), and a file that
+/// comes back different (changed on its way, as a failing drive would) fails the copy
+/// and is removed. A move across disks then keeps its original. With the check off, the
+/// same bad copy goes unnoticed.
+#[test]
+fn checked_copies_are_read_back() {
+    let ctx = egui::Context::default();
+    let q = std::sync::Arc::new(ops::Queue::default());
+    let d = tmpdir("check");
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i * 7 % 253) as u8).collect();
+    std::fs::write(d.join("big.bin"), &big).unwrap();
+    touch(&d.join("box/a.txt"), "a");
+    touch(&d.join("box/deep/b.txt"), "b");
+    let bad = format!("{} photo.jpg", ops::SPOILED);
+    touch(&d.join("bad/keep.txt"), "keep");
+    std::fs::write(d.join("bad").join(&bad), &big[..100_000]).unwrap();
+    std::fs::create_dir_all(d.join("out")).unwrap();
+    let job = |id, kind, check| {
+        let j = ops::spawn_in(id, kind, ctx.clone(), &q, check);
+        wait_job(&j);
+        j
+    };
+    let j = job(1, OpKind::Copy { srcs: vec![d.join("big.bin"), d.join("box")], dest: d.join("out"), decide: HashMap::new() }, true);
+    let g = j.progress.lock().unwrap();
+    assert!(g.errors.is_empty(), "{:?}", g.errors);
+    assert_eq!((g.total_bytes, g.done_bytes), (2 * (big.len() as u64 + 2), 2 * (big.len() as u64 + 2)), "copied, then read back");
+    drop(g);
+    assert_eq!(std::fs::read(d.join("out/big.bin")).unwrap(), big);
+    assert_eq!(std::fs::read_to_string(d.join("out/box/deep/b.txt")).unwrap(), "b");
+    // Shared extents (btrfs, XFS) write no bytes that could come back different.
+    if !reflinks(&d) {
+        let j = job(2, OpKind::Copy { srcs: vec![d.join("bad")], dest: d.join("out"), decide: HashMap::new() }, true);
+        let errs = j.progress.lock().unwrap().errors.clone();
+        assert!(errs.len() == 1 && errs[0].contains("read back from the disk differently"), "{errs:?}");
+        assert!(!d.join("out/bad").exists(), "no copy that is known to be wrong");
+        let j = job(3, OpKind::Copy { srcs: vec![d.join("bad")], dest: d.join("out"), decide: HashMap::new() }, false);
+        assert!(j.progress.lock().unwrap().errors.is_empty());
+        assert_ne!(std::fs::read(d.join("out/bad").join(&bad)).unwrap(), std::fs::read(d.join("bad").join(&bad)).unwrap(), "unchecked, the changed copy stays");
+    }
+    if let Some(shm) = other_fs("check") {
+        let j = job(4, OpKind::Move { srcs: vec![d.join("bad")], dest: shm.clone(), decide: HashMap::new() }, true);
+        assert_eq!(j.progress.lock().unwrap().errors.len(), 1);
+        assert!(d.join("bad").join(&bad).exists() && !shm.join("bad").exists(), "the original stays, the copy goes");
+        let j = job(5, OpKind::Move { srcs: vec![d.join("box")], dest: shm.clone(), decide: HashMap::new() }, true);
+        assert!(j.progress.lock().unwrap().errors.is_empty());
+        assert!(!d.join("box").exists() && std::fs::read_to_string(shm.join("box/a.txt")).unwrap() == "a", "a good copy moves");
+        let _ = std::fs::remove_dir_all(&shm);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Can files in `dir` share extents (a reflink copy)?
+fn reflinks(dir: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let (a, b) = (dir.join(".reflink-a"), dir.join(".reflink-b"));
+    std::fs::write(&a, b"x").unwrap();
+    let (r, w) = (std::fs::File::open(&a).unwrap(), std::fs::File::create(&b).unwrap());
+    let ok = unsafe { libc::ioctl(w.as_raw_fd(), 0x4004_9409, r.as_raw_fd()) } == 0;
+    let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
+    ok
+}
+
+/// Undo of a move to another disk moves it back through a job (a rename can't cross
+/// disks), and Redo moves it there again; a move over something brings that back from
+/// the trash on Undo, and Redo puts it in the trash again.
+#[test]
+fn a_move_to_another_disk_is_undone_and_redone() {
+    let Some(far) = other_fs("xundo") else { return };
+    let ctx = egui::Context::default();
+    let d = tmpdir("xundo");
+    touch(&d.join("a.txt"), "new a");
+    touch(&d.join("box/inner.txt"), "inner");
+    touch(&far.join("a.txt"), "old a");
+    let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+    let mut decide = HashMap::new();
+    decide.insert(d.join("a.txt"), Conflict::Overwrite);
+    app.start_job(OpKind::Move { srcs: vec![d.join("a.txt"), d.join("box")], dest: far.clone(), decide });
+    app_until(&mut app, &ctx, "the move", |a| a.undo.last().is_some_and(|u| matches!(u.kind, crate::app::UndoKind::MovedOver(..))));
+    assert_eq!(std::fs::read_to_string(far.join("a.txt")).unwrap(), "new a");
+    assert!(app.undo_last());
+    assert!(app.jobs.iter().any(|j| j.label == "Moving 2 items back"), "a job with its card");
+    app_until(&mut app, &ctx, "the move back", |a| a.job_steps.is_empty() && a.undo.can_redo());
+    assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "new a");
+    assert_eq!(std::fs::read_to_string(d.join("box/inner.txt")).unwrap(), "inner");
+    assert_eq!(std::fs::read_to_string(far.join("a.txt")).unwrap(), "old a", "what it replaced is back");
+    assert!(!far.join("box").exists() && app.undo.is_empty());
+    assert!(app.redo_last());
+    app_until(&mut app, &ctx, "the move again", |a| a.job_steps.is_empty() && !a.undo.is_empty());
+    assert_eq!(std::fs::read_to_string(far.join("a.txt")).unwrap(), "new a");
+    assert!(far.join("box/inner.txt").exists() && !d.join("a.txt").exists() && !d.join("box").exists());
+    assert!(!app.undo.can_redo());
+    // And back once more, by Undo again.
+    assert!(app.undo_last());
+    app_until(&mut app, &ctx, "back again", |a| a.job_steps.is_empty() && a.undo.can_redo());
+    assert_eq!(std::fs::read_to_string(far.join("a.txt")).unwrap(), "old a");
+    assert!(d.join("a.txt").exists() && d.join("box/inner.txt").exists());
+    purge_trashed_under(&far);
+    purge_trashed_under(&d);
+    let _ = std::fs::remove_dir_all(&far);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Each kind of change Undo takes back, Redo does again, after checking things are where
+/// Undo left them; a new change leaves nothing to redo.
+#[test]
+fn redo_does_each_change_again() {
+    use crate::app::{UndoEntry, UndoKind};
+    let ctx = egui::Context::default();
+    let d = tmpdir("redo");
+    let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+    let mut push = |app: &mut crate::app::App, label: &str, kind| app.undo.push(UndoEntry { label: label.into(), kind });
+    let read = |p: &str| std::fs::read_to_string(d.join(p)).ok();
+    // Renamed.
+    touch(&d.join("b.txt"), "a");
+    push(&mut app, "Rename", UndoKind::Rename(vec![(d.join("a.txt"), d.join("b.txt"))]));
+    assert!(app.undo_last() && read("a.txt").is_some() && read("b.txt").is_none());
+    assert!(app.undo.can_redo());
+    assert!(app.redo_last() && read("b.txt").is_some() && read("a.txt").is_none());
+    assert!(matches!(&app.undo.last().unwrap().kind, UndoKind::Rename(v) if v.len() == 1), "and Undo has it again");
+    // Moved within a disk.
+    touch(&d.join("to/m.txt"), "m");
+    push(&mut app, "Move", UndoKind::Move(vec![(d.join("m.txt"), d.join("to/m.txt"))]));
+    assert!(app.undo_last() && read("m.txt").is_some());
+    assert!(app.redo_last() && read("to/m.txt").is_some() && read("m.txt").is_none());
+    // Made (a copy, a new file): Undo trashes it, Redo brings it back from the trash.
+    touch(&d.join("made.txt"), "made");
+    push(&mut app, "Copy", UndoKind::Created(vec![d.join("made.txt")]));
+    assert!(app.undo_last() && read("made.txt").is_none());
+    assert!(app.redo_last() && read("made.txt").as_deref() == Some("made"));
+    // Trashed: Undo restores, Redo trashes again.
+    touch(&d.join("t.txt"), "t");
+    crate::trashcan::delete(&d.join("t.txt")).unwrap();
+    push(&mut app, "Trash", UndoKind::Trashed(vec![d.join("t.txt")]));
+    assert!(app.undo_last() && read("t.txt").is_some());
+    assert!(app.redo_last() && read("t.txt").is_none());
+    assert!(app.undo_last() && read("t.txt").is_some(), "and back once more");
+    assert!(app.redo_last());
+    // Changed in place: the original in the trash; Redo swaps the changed one back in.
+    touch(&d.join("pic.txt"), "original");
+    crate::trashcan::delete(&d.join("pic.txt")).unwrap();
+    touch(&d.join("pic.txt"), "turned");
+    push(&mut app, "Rotate", UndoKind::Replaced(vec![d.join("pic.txt")]));
+    assert!(app.undo_last() && read("pic.txt").as_deref() == Some("original"));
+    assert!(app.redo_last() && read("pic.txt").as_deref() == Some("turned"));
+    assert!(app.undo_last() && read("pic.txt").as_deref() == Some("original"));
+    // Sorted into folders it made: Redo makes them again.
+    touch(&d.join("Pictures/s.png"), "s");
+    push(&mut app, "Tidy", UndoKind::Sorted(vec![(d.join("s.png"), d.join("Pictures/s.png"))], vec![d.join("Pictures")]));
+    assert!(app.undo_last() && read("s.png").is_some() && !d.join("Pictures").exists());
+    assert!(app.redo_last() && read("Pictures/s.png").is_some());
+    // The world changed meanwhile: Redo refuses, and says so.
+    assert!(app.undo_last());
+    touch(&d.join("Pictures/s.png"), "someone else's");
+    assert!(!app.redo_last(), "a file in the way");
+    assert_eq!(read("s.png").as_deref(), Some("s"));
+    assert_eq!(read("Pictures/s.png").as_deref(), Some("someone else's"));
+    // A new change: nothing to redo.
+    assert!(app.undo_last() && app.undo.can_redo());
+    push(&mut app, "New", UndoKind::Created(vec![d.join("x")]));
+    assert!(!app.undo.can_redo());
+    purge_trashed_under(&d);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Undo and Redo outlast a restart: written to the state folder when they change, read
+/// back at start. What has nothing left to act on (its files gone) and what is past its
+/// age is left out; the lists keep at most their number of changes, the newest.
+#[test]
+fn undo_and_redo_survive_a_restart() {
+    use crate::app::{UndoEntry, UndoKind};
+    let ctx = egui::Context::default();
+    let d = tmpdir("undokeep");
+    let file = d.join("state/undo.json");
+    let start = |ctx: &egui::Context| {
+        let mut app = crate::app::App::new(ctx, vec![d.clone()]);
+        app.undo_keep = crate::undofile::Keeper::new(Some(file.clone()), ctx);
+        app_until(&mut app, ctx, "the lists read", |a| !a.undo_keep.loading());
+        app
+    };
+    let mut app = start(&ctx);
+    assert!(app.undo.is_empty() && !app.undo.can_redo());
+    touch(&d.join("b.txt"), "b");
+    touch(&d.join("made.txt"), "m");
+    touch(&d.join("moved/c.txt"), "c");
+    app.undo.push(UndoEntry { label: "Gone".into(), kind: UndoKind::Move(vec![(d.join("x"), d.join("nowhere/x"))]) });
+    app.undo.push(UndoEntry { label: "Rename a.txt to b.txt".into(), kind: UndoKind::Rename(vec![(d.join("a.txt"), d.join("b.txt"))]) });
+    app.undo.push(UndoEntry { label: "Copy made.txt".into(), kind: UndoKind::Created(vec![d.join("made.txt")]) });
+    app.undo.push(UndoEntry { label: "Move c.txt".into(), kind: UndoKind::Move(vec![(d.join("c.txt"), d.join("moved/c.txt"))]) });
+    assert!(app.undo_last() && d.join("c.txt").exists(), "one undone, for Redo");
+    app_until(&mut app, &ctx, "the write", |_| std::fs::read_to_string(&file).is_ok_and(|s| s.contains("Copy made.txt") && s.contains("Move c.txt")));
+    drop(app);
+    let mut app = start(&ctx);
+    let labels: Vec<String> = (0..app.undo.len()).map(|i| app.undo[i].label.clone()).collect();
+    assert_eq!(labels, ["Rename a.txt to b.txt", "Copy made.txt"], "the move whose files are gone is left out");
+    assert!(app.undo.can_redo(), "Redo kept too");
+    assert!(app.redo_last() && d.join("moved/c.txt").exists() && !d.join("c.txt").exists());
+    assert!(app.undo_last() && app.undo_last() && app.undo_last());
+    assert!(d.join("a.txt").exists() && !d.join("made.txt").exists(), "taken back after the restart");
+    // Past its age, and over the number kept.
+    for i in 0..(crate::undofile::MOST + 20) {
+        touch(&d.join(format!("n{i}")), "n");
+        app.undo.push(UndoEntry { label: format!("Make n{i}"), kind: UndoKind::Created(vec![d.join(format!("n{i}"))]) });
+    }
+    assert_eq!(app.undo.len(), crate::undofile::MOST);
+    let last = format!("Make n{}", crate::undofile::MOST + 19);
+    app_until(&mut app, &ctx, "the write", |_| std::fs::read_to_string(&file).is_ok_and(|s| s.contains(&last)));
+    drop(app);
+    let app = start(&ctx);
+    assert_eq!(app.undo.len(), crate::undofile::MOST);
+    assert_eq!(app.undo[0].label, "Make n20", "the oldest went");
+    drop(app);
+    std::fs::write(&file, format!(r#"{{"undo":[{{"at":1000,"label":"Old","kind":{{"Created":["{}"]}}}}],"redo":[]}}"#, d.join("n1").display())).unwrap();
+    let app = start(&ctx);
+    assert!(app.undo.is_empty(), "a change months old is left out");
+    purge_trashed_under(&d);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Selections in the previews, on real files: the part of each line a selection takes
+/// and its line breaks, words by double-click, the text copied out of lines; a big file's
+/// selected lines read back from disk through its line index (across the index's steps,
+/// tabs shown as spaces, to its end with Ctrl+A, cut at the most a copy takes) and its
+/// bytes as hex and as text; table cells as tab-separated lines; a data tree's rows and a
+/// picked value; a .env copied as shown.
+#[test]
+fn preview_selections_copy_what_is_shown() {
+    use crate::textsel::{END, Sel, lines_text, word};
+    use std::borrow::Cow;
+    let d = tmpdir("textsel");
+    // Lines and words.
+    let notes = d.join("notes.txt");
+    std::fs::write(&notes, "naïve café\tbar\r\nsecond_line here\n\nlast").unwrap();
+    let lines = crate::inspector::text_lines(&std::fs::read(&notes).unwrap()).unwrap();
+    assert_eq!(lines, ["naïve café    bar", "second_line here", "", "last"]);
+    let s = Sel::new((1, 7), (0, 7));
+    assert_eq!(s.span(), ((0, 7), (1, 7)), "in order whichever way it was dragged");
+    assert_eq!(s.on_line(0, lines[0].len()), Some((7, lines[0].len(), true)));
+    assert_eq!(s.on_line(1, lines[1].len()), Some((0, 7, false)));
+    assert_eq!(s.on_line(2, 0), None);
+    assert_eq!(Sel::new((2, 0), (3, 0)).on_line(2, 0), Some((0, 0, true)), "an empty line's break");
+    let get = |i: usize| lines.get(i).map(|l| Cow::Borrowed(l.as_str()));
+    assert_eq!(lines_text(&s, lines.len(), get), "café    bar\nsecond_");
+    assert_eq!(lines_text(&Sel::new((0, 0), END), lines.len(), get), "naïve café    bar\nsecond_line here\n\nlast", "all of it, no break after the last line");
+    assert_eq!(lines_text(&Sel::at((1, 3)), lines.len(), get), "");
+    assert_eq!(word(&lines[0], 2), (0, 6), "a word with a letter of two bytes");
+    assert_eq!(word(&lines[1], 3), (0, 11), "underscores are part of a word");
+    assert_eq!(word(&lines[0], 13), (12, 16), "spaces as a run");
+    assert_eq!(word(&lines[1], lines[1].len()), (12, 16), "at the end of a line, the word before it");
+    assert_eq!(word("a.b", 1), (1, 2), "anything else on its own");
+    assert_eq!(crate::textsel::byte_at_col("日本語", 2.4), 3, "wide characters take two columns");
+    // A big file: lines read back from the disk through the index.
+    let big = d.join("big.log");
+    let text: String = (0..3000).map(|i| if i % 500 == 7 { format!("{i}\twith a tab\n") } else { format!("line {i:05}\n") }).collect();
+    std::fs::write(&big, &text).unwrap();
+    let ctx = egui::Context::default();
+    let v = crate::bigfile::Pager::open(&big, text.len() as u64, false, &ctx).unwrap();
+    let t0 = Instant::now();
+    while !v.rows().1 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "indexed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let shown: Vec<String> = text.lines().map(|l| l.replace('\t', "    ")).collect();
+    let read = |v: &crate::bigfile::Pager, s: Sel| v.copy_lines(s, &ctx).recv_timeout(Duration::from_secs(20)).unwrap();
+    let (got, cut) = read(&v, Sel::new((1022, 5), (1025, 3)));
+    assert_eq!(got, format!("{}\n{}\n{}\n{}", &shown[1022][5..], shown[1023], shown[1024], &shown[1025][..3]), "across a step of the index");
+    assert!(!cut);
+    let (got, _) = read(&v, Sel::new((2507, 0), (2507, 9)));
+    assert_eq!(got, "2507    w", "a tab copied as the spaces shown");
+    let (got, _) = read(&v, Sel::new((0, 0), END));
+    assert_eq!(got, shown.join("\n"), "all of it");
+    let (got, cut) = crate::bigfile::selected_lines(&std::fs::File::open(&big).unwrap(), 0, 0, &Sel::new((10, 0), END), 100);
+    assert!(cut && got.len() == 100 && got.starts_with("line 00010\n"), "cut at the most a copy takes: {got:?}");
+    // Its bytes.
+    let blob = d.join("blob.bin");
+    let bytes: Vec<u8> = (0..=255u8).cycle().take(700_000).collect();
+    std::fs::write(&blob, &bytes).unwrap();
+    let h = crate::bigfile::Pager::open(&blob, bytes.len() as u64, true, &ctx).unwrap();
+    let (got, _) = h.copy_bytes(Sel::new(300_000, 299_997), false, &ctx).recv_timeout(Duration::from_secs(20)).unwrap();
+    let want: Vec<String> = bytes[299_997..=300_000].iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(got, want.join(" "), "both ends taken");
+    let (got, _) = h.copy_bytes(Sel::new(65, 70), true, &ctx).recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(got, "ABCDEF");
+    let (got, _) = h.copy_bytes(Sel::new(0, 3), true, &ctx).recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(got, "....", "what isn't printable as dots");
+    let (got, _) = h.copy_bytes(Sel::new(262_140, 262_150), false, &ctx).recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(got.split(' ').count(), 11, "read in pieces, one space between every byte");
+    // Tables, sheets and trees from the fixtures the previews show.
+    let dev = d.join("dev");
+    dev_fixture(&dev);
+    let csv = std::fs::read_to_string(dev.join("people.csv")).unwrap();
+    let mut tv = crate::table::TableView::new(crate::table::Table::from_text(&csv, "people.csv", false));
+    tv.sel = Some(Sel::new((2, 2), (1, 1)));
+    assert_eq!(tv.copy_text(), "\"Grace \"\"Amazing\"\" Hopper\"\tgrace@example.invalid\n\"Line\nbreak\"\tx@example.invalid", "quoted where a spreadsheet needs it");
+    assert!(tv.select_all());
+    assert!(tv.copy_text().starts_with("id\tname\temail\tjoined\tscore\n1\tAda Lovelace\t"), "all of it, with the titles");
+    assert_eq!(tv.copy_text().lines().count(), 6, "titles, four rows, one with a line break in quotes");
+    let json = std::fs::read_to_string(dev.join("package.json")).unwrap();
+    let mut t = crate::datatree::flatten(&crate::datatree::parse_json(&json).unwrap(), None);
+    let _ = t.rows();
+    let at = |t: &crate::datatree::Tree, key: &str| t.nodes.iter().position(|n| n.key == key).unwrap();
+    let (name, build, test) = (at(&t, "name"), at(&t, "build"), at(&t, "test"));
+    assert_eq!(t.row_text(build), ("build: \"vite build\"".to_string(), Some(7)));
+    t.tsel = Some(Sel::new((name, 6), (build, 5)));
+    let rows = t.copy_text();
+    assert!(rows.starts_with("\"maia-web\"\nversion: \"0.2.0\"\n") && rows.ends_with("scripts\n  build"), "rows as drawn, indented: {rows:?}");
+    t.tsel = None;
+    t.focus = true;
+    t.sel = test;
+    assert_eq!(t.copy_text(), "vitest", "the picked value, without quotes");
+    t.sel = at(&t, "scripts");
+    assert_eq!(t.copy_text(), "scripts\n  build: \"vite build\"\n  test: \"vitest\"", "a map as its rows");
+    t.toggle(t.sel);
+    let _ = t.rows();
+    assert_eq!(t.copy_text(), "scripts  {…} 2 keys", "folded, as it shows");
+    // A .env as shown: the mask until it is revealed.
+    let env = crate::inspector::text_lines(&std::fs::read(dev.join(".env")).unwrap()).unwrap();
+    let kinds = crate::envfile::classify(&env);
+    let (env, kinds) = (&env, &kinds);
+    let shown = |reveal: bool| move |i: usize| env.get(i).map(|l| Cow::Owned(crate::envfile::shown(l, kinds[i], reveal)));
+    let s = Sel::new((1, 0), (2, 100));
+    assert_eq!(lines_text(&s, env.len(), shown(false)), format!("export API_KEY={m}\nDATABASE_URL={m}", m = crate::envfile::MASK));
+    assert_eq!(lines_text(&s, env.len(), shown(true)), "export API_KEY=sk-live-0123456789\nDATABASE_URL=\"postgres://u:pw@localhost/db\"");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// What the picture viewer does to files, on real ones: turns through the ImageMagick
+/// here (`magick`, or version 6's `convert`), three in a row keeping one original in the
+/// trash and Undo bringing it back byte for byte; a tag toggled on and off by what the
+/// file holds, even when the tag cache read it before the change.
+#[test]
+fn viewer_turns_and_tags_real_pictures() {
+    let d = tmpdir("viewer-sort");
+    let pic = d.join("shot.png");
+    std::fs::write(&pic, png_bytes(40, 20, 4)).unwrap();
+    let shown = |p: &Path| crate::imgdec::load(p, 64).map(|x| x.1);
+    // Tags: the cache asked first, then changed under it.
+    assert!(crate::tags::get(&pic, |t| t.to_vec()).is_none(), "not read yet");
+    crate::viewer::toggle_tag(&pic, "Red").unwrap();
+    assert_eq!(crate::tags::read(&pic), ["Red"]);
+    crate::viewer::toggle_tag(&pic, "red").unwrap();
+    assert!(crate::tags::read(&pic).is_empty(), "off again, whatever its case");
+    crate::viewer::toggle_tag(&pic, "keep").unwrap();
+    crate::viewer::toggle_tag(&pic, "Blue").unwrap();
+    assert_eq!(crate::tags::read(&pic), ["keep", "Blue"]);
+    // Turns.
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for name in ["magick", "convert"] {
+        if let Some(real) = std::env::split_paths(&path).map(|p| p.join(name)).find(|m| m.is_file()) {
+            let _ = std::os::unix::fs::symlink(real, tools.join(name));
+        }
+    }
+    crate::drives::FAKE.with(|f| *f.borrow_mut() = Some(tools.clone()));
+    let t = crate::drives::Tools::current().unwrap();
+    crate::drives::FAKE.with(|f| *f.borrow_mut() = None);
+    let Some(prog) = crate::picfix::magick(&t) else {
+        eprintln!("viewer turns: no ImageMagick, skipped");
+        return;
+    };
+    let original = std::fs::read(&pic).unwrap();
+    let kept = std::sync::Mutex::new(HashSet::new());
+    let trashed = || crate::trashcan::list().into_iter().filter(|it| it.original == pic).count();
+    let before = trashed();
+    let (r, again) = crate::viewer::turn_once(&t, prog, &pic, true, &kept);
+    assert!(r.is_ok() && !again, "{r:?}");
+    assert_eq!(shown(&pic), Some([20, 40]));
+    let (r, again) = crate::viewer::turn_once(&t, prog, &pic, true, &kept);
+    assert!(r.is_ok() && again);
+    assert_eq!(shown(&pic), Some([40, 20]));
+    let (r, _) = crate::viewer::turn_once(&t, prog, &pic, false, &kept);
+    assert!(r.is_ok());
+    assert_eq!(shown(&pic), Some([20, 40]), "right, right, left: one turn right");
+    assert_eq!(trashed(), before + 1, "one original kept for three turns");
+    assert_eq!(crate::picfix::undo_replaced(std::slice::from_ref(&pic)), 0);
+    assert_eq!(std::fs::read(&pic).unwrap(), original, "the original back, byte for byte");
+    // Not a picture ImageMagick writes back: refused, the file as it was.
+    let svg = d.join("drawing.svg");
+    std::fs::write(&svg, "<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+    let (r, _) = crate::viewer::turn_once(&t, prog, &svg, true, &kept);
+    assert!(r.is_err());
+    assert_eq!(std::fs::read_to_string(&svg).unwrap(), "<svg xmlns='http://www.w3.org/2000/svg'/>");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ------------------------------------------------------------------ the Open and Save dialog
+
+fn unhex(parts: &[&str]) -> Vec<u8> {
+    let s: String = parts.concat();
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+/// The OpenFile call xdg-desktop-portal 1.18.4 sent Maia's backend for this request,
+/// made with gdbus through the real portal and taken off a private bus with
+/// `dbus-monitor --binary`: parent `x11:3a00007`, title "Upload a photo", several files,
+/// an accept label with a mnemonic, two filters (globs with classes, a MIME type), the
+/// first as current, a choice with options and a yes-or-no one, and /tmp to start in.
+const PORTAL_OPEN_CALL: &[&str] = &[
+    "6c01000159020000220000009d00000001016f001f0000002f6f72672f667265656465736b746f702f706f7274616c2f",
+    "6465736b746f700002017300270000006f72672e667265656465736b746f702e696d706c2e706f7274616c2e46696c65",
+    "43686f6f7365720006017300040000003a312e320000000008016700096f737373617b73767d00000301730008000000",
+    "4f70656e46696c65000000000000000007017300040000003a312e3100000000310000002f6f72672f66726565646573",
+    "6b746f702f706f7274616c2f6465736b746f702f726571756573742f315f332f6d616961310000000000000000000000",
+    "0b0000007831313a33613030303037000e00000055706c6f616420612070686f746f0000f10100000c00000061636365",
+    "70745f6c6162656c00017300070000005f55706c6f616400080000006d756c7469706c65000162000100000000000000",
+    "0700000066696c74657273000961287361287573292900005a0000000000000006000000496d6167657300002b000000",
+    "000000000e0000002a2e5b70505d5b6e4e5d5b67475d0000010000000a000000696d6167652f6a706567000000000000",
+    "03000000416c6c000a0000000000000000000000010000002a000000000000000e00000063757272656e745f66696c74",
+    "6572000828736128757329290000000006000000496d6167657300002b000000000000000e0000002a2e5b70505d5b6e",
+    "4e5d5b67475d0000010000000a000000696d6167652f6a7065670000000000000700000063686f69636573000b612873",
+    "7361287373297329000000009200000008000000656e636f64696e670000000008000000456e636f64696e6700000000",
+    "300000000000000004000000757466380000000007000000556e69636f646500060000006c6174696e31000007000000",
+    "5765737465726e000400000075746638000000000000000002000000726f00000900000052656164206f6e6c79000000",
+    "00000000000000000500000066616c7365000000000000000e00000063757272656e745f666f6c646572000261790000",
+    "050000002f746d7000",
+];
+
+/// The Close the portal sent for it when the app (gdbus) went away.
+const PORTAL_CLOSE_CALL: &[&str] = &[
+    "6c0100010000000024000000a500000001016f00310000002f6f72672f667265656465736b746f702f706f7274616c2f",
+    "6465736b746f702f726571756573742f315f332f6d616961310000000000000002017300230000006f72672e66726565",
+    "6465736b746f702e696d706c2e706f7274616c2e52657175657374000000000006017300040000003a312e3200000000",
+    "08016700000000000301730005000000436c6f736500000007017300040000003a312e3100000000",
+];
+
+/// The portal's own messages read as Maia reads them: the request with every option, the
+/// Close on its handle, and the body written again byte for byte the same. Answers go
+/// back as `ua{sv}`; between the backend and a picker window, requests and answers pass
+/// whole; a message cut short or nested without end is refused, not followed.
+#[test]
+fn portal_requests_read_and_answers_written() {
+    use crate::portal::{Answer, Filter, Mode, Pick, Val, parse, put, reply_body};
+    let m = crate::fm1::read(&mut std::io::Cursor::new(unhex(PORTAL_OPEN_CALL))).expect("a whole message");
+    assert_eq!((m.kind, m.path.as_str(), m.interface.as_str(), m.member.as_str(), m.signature.as_str()), (1, "/org/freedesktop/portal/desktop", crate::portal::IFACE, "OpenFile", "osssa{sv}"));
+    let (handle, p) = Pick::from_call(&m.member, &m.signature, &m.body).expect("a request");
+    assert_eq!(handle, "/org/freedesktop/portal/desktop/request/1_3/maia1");
+    assert_eq!((p.mode, p.parent.as_str(), p.title.as_str(), p.accept_label.as_str(), p.multiple, p.directory), (Mode::Open, "x11:3a00007", "Upload a photo", "Upload", true, false));
+    let images = Filter { name: "Images".into(), rules: vec![(0, "*.[pP][nN][gG]".into()), (1, "image/jpeg".into())] };
+    assert_eq!(p.filters, vec![images.clone(), Filter { name: "All".into(), rules: vec![(0, "*".into())] }]);
+    assert_eq!(p.current_filter, Some(0), "the current filter is one of the list");
+    assert_eq!(p.choices.len(), 2);
+    assert_eq!((p.choices[0].id.as_str(), p.choices[0].label.as_str(), p.choices[0].chosen.as_str()), ("encoding", "Encoding", "utf8"));
+    assert_eq!(p.choices[0].options, vec![("utf8".to_string(), "Unicode".to_string()), ("latin1".into(), "Western".into())]);
+    assert!(p.choices[1].options.is_empty() && p.choices[1].chosen == "false", "a yes or no");
+    assert_eq!(p.current_folder.as_deref(), Some(Path::new("/tmp")), "the nul-terminated path");
+    // Read and written again, the body is the portal's to the byte (alignment of the
+    // empty `a(ss)` included).
+    let vals = parse(&m.signature, &m.body).unwrap();
+    let mut again = vec![];
+    for (sig, v) in ["o", "s", "s", "s", "a{sv}"].iter().zip(&vals) {
+        put(&mut again, sig, v);
+    }
+    assert_eq!(again, m.body);
+    let c = crate::fm1::read(&mut std::io::Cursor::new(unhex(PORTAL_CLOSE_CALL))).unwrap();
+    assert_eq!((c.path.as_str(), c.interface.as_str(), c.member.as_str()), (handle.as_str(), "org.freedesktop.impl.portal.Request", "Close"));
+    // The answer: picked files, the questions' answers and the filter in use, by name.
+    let a = Answer { response: 0, uris: vec!["file:///tmp/a%20b.png".into(), "file:///tmp/c.jpg".into()], choices: vec![("encoding".into(), "latin1".into()), ("ro".into(), "true".into())], filter: Some(0) };
+    let v = parse("ua{sv}", &reply_body(&p, &a)).unwrap();
+    assert_eq!(v[0], Val::U32(0));
+    let Val::List(results) = &v[1] else { panic!("{v:?}") };
+    let get = |k: &str| results.iter().find_map(|e| match e {
+        Val::Tuple(t) if t[0] == Val::Str(k.into()) => match &t[1] {
+            Val::Var(_, x) => Some(x.as_ref().clone()),
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(get("uris"), Some(Val::List(a.uris.iter().map(|u| Val::Str(u.clone())).collect())));
+    assert_eq!(get("choices"), Some(Val::List(vec![Val::Tuple(vec![Val::Str("encoding".into()), Val::Str("latin1".into())]), Val::Tuple(vec![Val::Str("ro".into()), Val::Str("true".into())])])));
+    let Some(Val::Tuple(f)) = get("current_filter") else { panic!("no filter") };
+    assert_eq!(f[0], Val::Str("Images".into()));
+    // Cancelled: response 1 and nothing else.
+    let v = parse("ua{sv}", &reply_body(&p, &Answer::cancelled())).unwrap();
+    assert_eq!(v, vec![Val::U32(1), Val::List(vec![])]);
+    // Between the backend and the window: the request and the answer whole.
+    let mut p2 = p.clone();
+    p2.current_name = "naïve name.txt".into();
+    p2.files = vec!["one.txt".into(), "two\nlines.txt".into()];
+    p2.current_file = Some("/tmp/x y/z".into());
+    assert_eq!(Pick::decode(&p2.encode()), p2);
+    assert_eq!(Answer::decode(&a.encode()), a);
+    assert_eq!(Answer::decode(b""), Answer::ended(), "a picker that said nothing ended some other way");
+    assert_eq!(Answer::decode(b"uri\0file:///x\0"), Answer::ended(), "an answer without its response is no answer");
+    // A current filter that is not in the list (or no list) is applied by itself.
+    let mut b = vec![];
+    for s in [Val::Str("/r/1".into()), Val::Str("app".into()), Val::Str("".into()), Val::Str("Save".into())] {
+        put(&mut b, "s", &s);
+    }
+    let docs = Val::Tuple(vec![Val::Str("Docs".into()), Val::List(vec![Val::Tuple(vec![Val::U32(0), Val::Str("*.odt".into())])])]);
+    let opts = Val::List(vec![
+        Val::Tuple(vec![Val::Str("current_filter".into()), Val::Var("(sa(us))".into(), Box::new(docs))]),
+        Val::Tuple(vec![Val::Str("current_name".into()), Val::Var("s".into(), Box::new(Val::Str("Untitled.odt".into())))]),
+        Val::Tuple(vec![Val::Str("current_file".into()), Val::Var("ay".into(), Box::new(Val::Bytes(b"/tmp/old.odt\0".to_vec())))]),
+        Val::Tuple(vec![Val::Str("a number".into()), Val::Var("x".into(), Box::new(Val::Other))]),
+    ]);
+    put(&mut b, "a{sv}", &opts);
+    // An int64 nobody asked for is read past: its 8 bytes written as zeroes here.
+    let (_, s) = Pick::from_call("SaveFile", "osssa{sv}", &b).unwrap();
+    assert_eq!((s.mode, s.current_filter, s.filters.len(), s.current_name.as_str()), (Mode::Save, Some(0), 1, "Untitled.odt"));
+    assert_eq!(s.current_file.as_deref(), Some(Path::new("/tmp/old.odt")));
+    assert!(Pick::from_call("Explode", "osssa{sv}", &b).is_none() && Pick::from_call("OpenFile", "s", &b).is_none());
+    for cut in [3, 17, 40, b.len() - 3] {
+        assert!(Pick::from_call("SaveFile", "osssa{sv}", &b[..cut]).is_none(), "cut at {cut}");
+    }
+    let mut deep = vec![];
+    for _ in 0..200 {
+        deep.extend_from_slice(&[1, b'v', 0]);
+    }
+    assert!(parse("v", &deep).is_none(), "variants in variants without end");
+    // A backend whose program an update replaced opens pickers with the new one.
+    let d = tmpdir("portal-exe");
+    let exe = d.join("maia");
+    touch(&exe, "new build");
+    assert_eq!(crate::portal::picker_exe(&exe), Some(exe.clone()));
+    assert_eq!(crate::portal::picker_exe(Path::new(&format!("{} (deleted)", exe.display()))), Some(exe.clone()));
+    assert_eq!(crate::portal::picker_exe(&d.join("gone (deleted)")), None, "nothing at the path: no picker");
+    let _ = std::fs::remove_dir_all(&d);
+    assert_eq!(crate::portal::plain_label("_Open"), "Open");
+    assert_eq!(crate::portal::plain_label("Save __as"), "Save _as");
+}
+
+/// Globs as the portal's filters write them (classes, ranges, negation) and MIME types
+/// with the shared database's subclasses: a C file is plain text, `image/*` takes a PNG.
+/// Folders always pass, so the list can still be walked; folder mode lists only folders.
+#[test]
+fn picker_filters_let_through_what_the_app_asked() {
+    use crate::picker::{Accept, glob, mime_is};
+    let g = |p: &str, n: &str| glob(&p.chars().collect::<Vec<_>>(), &n.chars().collect::<Vec<_>>());
+    assert!(g("*.[pP][nN][gG]", "Shot.PnG") && g("*.[pP][nN][gG]", "a.png") && !g("*.[pP][nN][gG]", "a.jpg"));
+    assert!(g("*", "anything") && g("?.txt", "a.txt") && !g("?.txt", "ab.txt"));
+    assert!(g("report-[0-9][0-9].pdf", "report-07.pdf") && !g("report-[0-9][0-9].pdf", "report-7a.pdf"));
+    assert!(g("[!.]*", "visible") && !g("[!.]*", ".hidden"));
+    assert!(g("*.tar.gz", "x.tar.gz") && !g("*.tar.gz", "x.tar.gz.part"));
+    assert!(g("[", "[") && !g("*.PNG", "a.png"), "a lone bracket is itself; patterns are case-sensitive");
+    assert!(mime_is("image/png", "image/*") && !mime_is("text/plain", "image/*") && mime_is("text/plain", "*"));
+    assert!(mime_is("text/x-csrc", "text/plain") && mime_is("text/markdown", "text/plain"), "every text is plain text");
+    if std::path::Path::new("/usr/share/mime/subclasses").is_file() {
+        assert!(mime_is("application/x-shellscript", "text/plain"), "a subclass of the shared database");
+        assert!(mime_is("image/svg+xml", "application/xml"));
+    }
+    let d = tmpdir("picker-filters");
+    for f in ["a.png", "b.JPG", "c.jpeg", "notes.txt", "sub/x"] {
+        touch(&d.join(f), "x");
+    }
+    let e = |n: &str| crate::fsx::Entry::from_path(&d.join(n)).unwrap();
+    let mut p = crate::portal::Pick::default();
+    p.filters = vec![crate::portal::Filter { name: "Images".into(), rules: vec![(0, "*.[pP][nN][gG]".into()), (1, "image/jpeg".into())] }, crate::portal::Filter { name: "Nothing known".into(), rules: vec![(7, "?".into())] }];
+    let a = Accept::new(&p, Some(0)).unwrap();
+    assert!(a.ok(&e("a.png")) && a.ok(&e("b.JPG")) && a.ok(&e("c.jpeg")) && !a.ok(&e("notes.txt")));
+    assert!(a.ok(&e("sub")), "folders pass, to walk into");
+    assert!(Accept::new(&p, Some(1)).is_none() && Accept::new(&p, None).is_none(), "nothing Maia can read filters nothing");
+    p.directory = true;
+    let a = Accept::new(&p, Some(0)).unwrap();
+    assert!(a.ok(&e("sub")) && !a.ok(&e("a.png")), "folder mode: folders only");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Turning it on puts one line in the portals.conf the portal reads, keeps every other
+/// line, and remembers what was there; off puts it back. With no file of the user's, a
+/// copy of the desktop's own is made (portals before 1.20.1 read only the first file
+/// found) and taken away again. All in temporary folders, never the real home.
+#[test]
+fn picker_routing_merges_and_restores_portals_conf() {
+    use crate::portal::{IFACE, Places, conf_set, is_on, turn_off, turn_on};
+    // The text alone.
+    let (t, prev) = conf_set("# mine\n[preferred]\ndefault=hyprland;gtk\norg.freedesktop.impl.portal.ScreenCast=hyprland\n\n[other]\nx=1\n", IFACE, Some("maia"));
+    assert_eq!(t, "# mine\n[preferred]\ndefault=hyprland;gtk\norg.freedesktop.impl.portal.ScreenCast=hyprland\norg.freedesktop.impl.portal.FileChooser=maia\n\n[other]\nx=1\n");
+    assert_eq!(prev, None);
+    let (t2, prev) = conf_set(&t, IFACE, Some("kde"));
+    assert_eq!((prev.as_deref(), t2.matches("FileChooser").count()), (Some("maia"), 1), "replaced in place");
+    let (t3, _) = conf_set(&t2, IFACE, None);
+    assert!(!t3.contains("FileChooser") && t3.contains("ScreenCast=hyprland") && t3.contains("[other]\nx=1"));
+    assert_eq!(conf_set("", IFACE, Some("maia")).0, "[preferred]\norg.freedesktop.impl.portal.FileChooser=maia\n");
+    assert_eq!(conf_set("[other]\na=b\n", IFACE, Some("maia")).0, "[other]\na=b\n\n[preferred]\norg.freedesktop.impl.portal.FileChooser=maia\n");
+    assert_eq!(conf_set("[preferred]\n org.freedesktop.impl.portal.FileChooser = gtk \n", IFACE, None).1.as_deref(), Some("gtk"), "spaces around =");
+    let d = tmpdir("picker-routing");
+    let sys = d.join("usr/share/xdg-desktop-portal");
+    touch(&sys.join("hyprland-portals.conf"), "[preferred]\ndefault=hyprland;gtk\n");
+    let pl = Places { data: d.join("data"), config: d.join("config"), state: d.join("state/previous-file-chooser.json"), desktops: vec!["hyprland".into()], system: vec![d.join("etc/xdg-desktop-portal"), sys.clone()], merges: false };
+    let exe = Path::new("/opt/maia/bin/maia");
+    // No file of the user's: one for this desktop, copied from the desktop's.
+    assert!(!is_on(&pl));
+    turn_on(&pl, exe).unwrap();
+    let mine = d.join("config/xdg-desktop-portal/hyprland-portals.conf");
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "[preferred]\ndefault=hyprland;gtk\norg.freedesktop.impl.portal.FileChooser=maia\n");
+    assert_eq!(std::fs::read_to_string(pl.portal_file()).unwrap(), crate::portal::PORTAL_FILE);
+    assert_eq!(std::fs::read_to_string(pl.service_file()).unwrap(), "[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.maia\nExec=/opt/maia/bin/maia --portal\n");
+    assert!(is_on(&pl));
+    turn_on(&pl, exe).unwrap();
+    turn_off(&pl).unwrap();
+    assert!(!mine.exists() && !pl.portal_file().exists() && !pl.service_file().exists() && !pl.state.exists(), "everything Maia made is gone");
+    assert!(!is_on(&pl));
+    // A file of the user's, routed to KDE's dialog, with their own lines: kept, and KDE
+    // again after.
+    let generic = d.join("config/xdg-desktop-portal/portals.conf");
+    let theirs = "[preferred]\n# my choice\ndefault=gtk\norg.freedesktop.impl.portal.FileChooser=kde\n";
+    touch(&generic, theirs);
+    turn_on(&pl, exe).unwrap();
+    assert!(!mine.exists(), "the file read now is the one changed");
+    assert_eq!(std::fs::read_to_string(&generic).unwrap(), "[preferred]\n# my choice\ndefault=gtk\norg.freedesktop.impl.portal.FileChooser=maia\n");
+    // Turned on twice, the first previous value is the one kept.
+    turn_on(&pl, exe).unwrap();
+    // A line the user added meanwhile stays.
+    let edited = std::fs::read_to_string(&generic).unwrap() + "org.freedesktop.impl.portal.Print=gtk\n";
+    std::fs::write(&generic, &edited).unwrap();
+    turn_off(&pl).unwrap();
+    assert_eq!(std::fs::read_to_string(&generic).unwrap(), format!("{theirs}org.freedesktop.impl.portal.Print=gtk\n"));
+    // A copy Maia made and the user changed since is theirs now: kept, without the line.
+    std::fs::remove_file(&generic).unwrap();
+    turn_on(&pl, exe).unwrap();
+    std::fs::write(&mine, std::fs::read_to_string(&mine).unwrap() + "org.freedesktop.impl.portal.Screenshot=hyprland\n").unwrap();
+    turn_off(&pl).unwrap();
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "[preferred]\ndefault=hyprland;gtk\norg.freedesktop.impl.portal.Screenshot=hyprland\n");
+    // A portal that falls back from file to file (1.21.1 on) gets the line alone, so the
+    // desktop's own file still decides the rest.
+    std::fs::remove_file(&mine).unwrap();
+    let pl = Places { merges: true, ..pl };
+    turn_on(&pl, exe).unwrap();
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "[preferred]\norg.freedesktop.impl.portal.FileChooser=maia\n");
+    assert!(is_on(&pl));
+    turn_off(&pl).unwrap();
+    assert!(!mine.exists() && !is_on(&pl));
+    // What the Options row says is missing: no portal, or one before 1.20.1 without the
+    // packaged file.
+    use crate::portal::{missing, version_of};
+    assert_eq!(version_of("xdg-desktop-portal 1.18.4\n"), Some((1, 18, 4)));
+    assert_eq!(version_of("xdg-desktop-portal 1.21"), Some((1, 21, 0)));
+    assert!(missing(None, false).is_some() && missing(Some((1, 18, 4)), false).is_some());
+    assert!(missing(Some((1, 18, 4)), true).is_none() && missing(Some((1, 20, 1)), false).is_none() && missing(Some((1, 22, 0)), false).is_none());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The backend on a private bus (never the user's): the portal's calls, made by the real
+/// xdg-desktop-portal when it is installed, reach the picker and its answer comes back to
+/// the app as the Response signal; a Close ends the picker and no answer is sent. Without
+/// the portal the backend is called directly. Introspection and the portal's GetAll work.
+#[test]
+fn portal_backend_answers_through_the_real_portal() {
+    use crate::fm1::{Bus, put_str};
+    use crate::portal::{Answer, NAME, Pick, Stop, Val, parse, put};
+    if !crate::media::have("dbus-daemon") {
+        return;
+    }
+    let d = tmpdir("portal-bus");
+    let sock = d.join("bus");
+    let conf = d.join("bus.conf");
+    std::fs::write(&conf, format!("<busconfig><type>session</type><listen>unix:path={}</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow send_destination=\"*\" eavesdrop=\"true\"/><allow eavesdrop=\"true\"/><allow own=\"*\"/></policy></busconfig>", sock.display())).unwrap();
+    let mut daemon = std::process::Command::new("dbus-daemon").arg(format!("--config-file={}", conf.display())).arg("--nofork").stdout(std::process::Stdio::null()).spawn().unwrap();
+    let start = Instant::now();
+    while !sock.exists() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let addr = format!("unix:path={}", sock.display());
+    let mut backend = Bus::connect(&addr).unwrap();
+    assert!(backend.own(NAME));
+    // A stand-in for the window: picks by the title, or waits to be closed.
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<String>();
+    let closed_tx = std::sync::Mutex::new(closed_tx);
+    let run = move |p: &Pick, stop: &Stop| -> Answer {
+        if p.title == "wait" {
+            let t0 = Instant::now();
+            while !stop.stopped() && t0.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = closed_tx.lock().unwrap().send(p.title.clone());
+            return Answer::ended();
+        }
+        let name = if p.current_name.is_empty() { "picked.png" } else { &p.current_name };
+        Answer { response: 0, uris: vec![format!("file:///tmp/{}", name.replace(' ', "%20"))], choices: vec![], filter: p.current_filter }
+    };
+    std::thread::spawn(move || crate::portal::serve(backend, std::sync::Arc::new(run)));
+    let mut app = Bus::connect(&addr).unwrap();
+    let opts = |items: Vec<(&str, &str, Val)>| Val::List(items.into_iter().map(|(k, s, v)| Val::Tuple(vec![Val::Str(k.into()), Val::Var(s.into(), Box::new(v))])).collect());
+    // Directly, as the portal calls it.
+    let mut body = vec![];
+    for (sig, v) in [("o", Val::Str("/org/freedesktop/portal/desktop/request/1_9/direct".into())), ("s", Val::Str("test".into())), ("s", Val::Str(String::new())), ("s", Val::Str("Save as".into()))] {
+        put(&mut body, sig, &v);
+    }
+    put(&mut body, "a{sv}", &opts(vec![("current_name", "s", Val::Str("a b.txt".into()))]));
+    let r = app.call(NAME, "/org/freedesktop/portal/desktop", crate::portal::IFACE, "SaveFile", "osssa{sv}", &body).expect("an answer");
+    let v = parse(&r.signature, &r.body).unwrap();
+    assert_eq!(v[0], Val::U32(0));
+    assert!(format!("{v:?}").contains("file:///tmp/a%20b.txt"));
+    let intro = app.call(NAME, "/org/freedesktop/portal/desktop", "org.freedesktop.DBus.Introspectable", "Introspect", "", &[]).unwrap();
+    assert!(String::from_utf8_lossy(&intro.body).contains("SaveFiles"));
+    let mut b = vec![];
+    put_str(&mut b, crate::portal::IFACE);
+    let all = app.call(NAME, "/org/freedesktop/portal/desktop", "org.freedesktop.DBus.Properties", "GetAll", "s", &b).unwrap();
+    assert_eq!(parse(&all.signature, &all.body).unwrap(), vec![Val::List(vec![])]);
+    // Through the real portal, when it is here.
+    let frontend = ["/usr/libexec/xdg-desktop-portal", "/usr/lib/xdg-desktop-portal"].into_iter().find(|p| Path::new(p).is_file());
+    if let Some(exe) = frontend {
+        let dir = d.join("portals");
+        touch(&dir.join("maia.portal"), crate::portal::PORTAL_FILE);
+        touch(&dir.join("portals.conf"), "[preferred]\ndefault=none\norg.freedesktop.impl.portal.FileChooser=maia\n");
+        let mut xdp = std::process::Command::new(exe)
+            .env_clear()
+            .env("DBUS_SESSION_BUS_ADDRESS", &addr)
+            .env("XDG_DESKTOP_PORTAL_DIR", &dir)
+            .env("XDG_CURRENT_DESKTOP", "test")
+            .env("HOME", &d)
+            .env("XDG_RUNTIME_DIR", &d)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // The portal is up once it owns its name.
+        let t0 = Instant::now();
+        loop {
+            let mut b = vec![];
+            put_str(&mut b, "org.freedesktop.portal.Desktop");
+            if app.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", &b).is_some() {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "the portal started");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut b = vec![];
+        put_str(&mut b, "type='signal',interface='org.freedesktop.portal.Request',member='Response'");
+        app.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", &b).unwrap();
+        let ask = |app: &mut Bus, method: &str, title: &str, o: Val| -> String {
+            let mut body = vec![];
+            put(&mut body, "s", &Val::Str("x11:1c00003".into()));
+            put(&mut body, "s", &Val::Str(title.into()));
+            put(&mut body, "a{sv}", &o);
+            let r = app.call("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.FileChooser", method, "ssa{sv}", &body).expect("the portal took it");
+            match parse(&r.signature, &r.body).unwrap().remove(0) {
+                Val::Str(h) => h,
+                v => panic!("{v:?}"),
+            }
+        };
+        let response = |app: &mut Bus, handle: &str| -> Vec<Val> {
+            loop {
+                let m = app.recv().expect("a signal");
+                if m.member == "Response" && m.path == handle {
+                    return parse(&m.signature, &m.body).unwrap();
+                }
+            }
+        };
+        let images = Val::Tuple(vec![Val::Str("Images".into()), Val::List(vec![Val::Tuple(vec![Val::U32(1), Val::Str("image/*".into())])])]);
+        let h = ask(&mut app, "OpenFile", "Open a picture", opts(vec![("handle_token", "s", Val::Str("t1".into())), ("filters", "a(sa(us))", Val::List(vec![images.clone()])), ("current_filter", "(sa(us))", images)]));
+        assert!(h.ends_with("/t1"), "{h}");
+        let v = response(&mut app, &h);
+        assert_eq!(v[0], Val::U32(0));
+        let s = format!("{v:?}");
+        assert!(s.contains("file:///tmp/picked.png") && s.contains("Images"), "{s}");
+        let h = ask(&mut app, "SaveFile", "Save the page", opts(vec![("handle_token", "s", Val::Str("t2".into())), ("current_name", "s", Val::Str("page one.html".into()))]));
+        assert!(format!("{:?}", response(&mut app, &h)).contains("file:///tmp/page%20one.html"));
+        // Closed by the app: the picker goes, and nothing answers.
+        let h = ask(&mut app, "OpenFile", "wait", opts(vec![("handle_token", "s", Val::Str("t3".into()))]));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(app.call("org.freedesktop.portal.Desktop", &h, "org.freedesktop.portal.Request", "Close", "", &[]).is_some());
+        assert_eq!(closed_rx.recv_timeout(Duration::from_secs(10)).ok().as_deref(), Some("wait"), "the picker was told to go");
+        let _ = xdp.kill();
+        let _ = xdp.wait();
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A picker window's answer in each mode, from the real app over a real folder: one file,
+/// several (in the order listed), a folder (the one shown or the one selected), a new
+/// name, a name already taken (asked first), a folder's name (gone into), several names
+/// to save in a folder, Cancel and Escape. The app's filter decides what is listed.
+#[test]
+fn picker_answers_each_mode() {
+    use crate::picker::{Picker, accept, cancel};
+    use crate::portal::{Answer, Filter, Mode, Pick};
+    let d = tmpdir("picker-modes");
+    for f in ["a.png", "b.txt", "c d.png", "keep.txt", "sub/inner.txt"] {
+        touch(&d.join(f), "x");
+    }
+    let uri = |p: &Path| crate::clipboard::path_to_uri(p);
+    let ctx = egui::Context::default();
+    let frame = |app: &mut crate::app::App, events: Vec<egui::Event>| {
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 640.0))), events, ..Default::default() };
+        let _ = ctx.run(raw, |c| app.frame(c));
+    };
+    let open = |pick: Pick| -> crate::app::App {
+        let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+        app.picker = Some(Box::new(Picker::new(pick)));
+        let t0 = Instant::now();
+        loop {
+            frame(&mut app, vec![]);
+            if !app.tab().is_loading() && !app.tab().dirty || t0.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        frame(&mut app, vec![]);
+        app
+    };
+    let select = |app: &mut crate::app::App, names: &[&str]| {
+        let t = app.tab();
+        t.selected.clear();
+        for n in names {
+            let i = t.entries.iter().position(|e| e.name == *n).unwrap_or_else(|| panic!("{n} listed"));
+            t.selected.insert(i as u32);
+            t.cursor = Some(i as u32);
+        }
+    };
+    let done = |app: &crate::app::App| app.picker.as_ref().and_then(|p| p.done.clone());
+    let listed = |app: &mut crate::app::App| -> Vec<String> {
+        let t = app.tab();
+        let mut v: Vec<String> = t.view.iter().map(|&i| t.entries[i as usize].name.clone()).collect();
+        v.sort();
+        v
+    };
+    // One file, with the filter the app gave: only pictures (and folders) are listed.
+    let pngs = Filter { name: "Pictures".into(), rules: vec![(0, "*.[pP][nN][gG]".into())] };
+    let mut app = open(Pick { filters: vec![Filter { name: "Text".into(), rules: vec![(1, "text/plain".into())] }, pngs.clone()], current_filter: Some(1), ..Default::default() });
+    assert_eq!(listed(&mut app), ["a.png", "c d.png", "sub"]);
+    select(&mut app, &["a.png"]);
+    accept(&mut app);
+    assert_eq!(done(&app), Some(Answer { response: 0, uris: vec![uri(&d.join("a.png"))], choices: vec![], filter: Some(1) }));
+    assert!(app.quit, "the window closes with its answer");
+    // Several, in the order listed; without `multiple` only the first.
+    for multiple in [true, false] {
+        let mut app = open(Pick { multiple, ..Default::default() });
+        assert_eq!(listed(&mut app).len(), 5, "no filter: everything");
+        select(&mut app, &["c d.png", "a.png", "sub"]);
+        accept(&mut app);
+        let want: Vec<String> = if multiple { vec![uri(&d.join("a.png")), uri(&d.join("c d.png"))] } else { vec![uri(&d.join("a.png"))] };
+        assert_eq!(done(&app).map(|a| a.uris), Some(want), "multiple {multiple}");
+    }
+    // A folder alone is gone into, not answered.
+    let mut app = open(Pick::default());
+    select(&mut app, &["sub"]);
+    accept(&mut app);
+    assert!(done(&app).is_none() && app.tab().path == d.join("sub"));
+    // Folders: the one shown, or the one selected; files are not listed.
+    let mut app = open(Pick { directory: true, ..Default::default() });
+    assert_eq!(listed(&mut app), ["sub"]);
+    accept(&mut app);
+    assert_eq!(done(&app).map(|a| a.uris), Some(vec![uri(&d)]));
+    let mut app = open(Pick { directory: true, ..Default::default() });
+    select(&mut app, &["sub"]);
+    assert!(crate::picker::enter(&mut app), "Enter answers in folder mode");
+    assert_eq!(done(&app).map(|a| a.uris), Some(vec![uri(&d.join("sub"))]));
+    // Save: the name given, in the folder shown, with the app's question answered.
+    let q = crate::portal::Choice { id: "ro".into(), label: "Compress".into(), options: vec![], chosen: "true".into() };
+    let mut app = open(Pick { mode: Mode::Save, current_name: "new file.txt".into(), choices: vec![q], ..Default::default() });
+    assert_eq!(app.picker.as_ref().unwrap().name, "new file.txt");
+    accept(&mut app);
+    assert_eq!(done(&app), Some(Answer { response: 0, uris: vec![uri(&d.join("new file.txt"))], choices: vec![("ro".into(), "true".into())], filter: None }));
+    // A name already there asks first; the app does the replacing.
+    let mut app = open(Pick { mode: Mode::Save, current_name: "keep.txt".into(), ..Default::default() });
+    accept(&mut app);
+    assert!(done(&app).is_none());
+    let crate::popups::Popup::Choose { choices, msg, .. } = std::mem::replace(&mut app.popup, crate::popups::Popup::None) else { panic!("asked to replace") };
+    assert!(msg.contains("keep.txt"));
+    let (label, risky, f) = choices.into_iter().next().unwrap();
+    assert_eq!((label.as_str(), risky), ("Replace", true));
+    (f.unwrap())(&mut app);
+    assert_eq!(done(&app).map(|a| a.uris), Some(vec![uri(&d.join("keep.txt"))]));
+    assert_eq!(std::fs::read_to_string(d.join("keep.txt")).unwrap(), "x", "Maia itself writes nothing");
+    // A folder's name goes into it; a file clicked in the list names the file.
+    let mut app = open(Pick { mode: Mode::Save, current_name: "sub".into(), ..Default::default() });
+    accept(&mut app);
+    assert!(done(&app).is_none() && app.tab().path == d.join("sub") && app.picker.as_ref().unwrap().name.is_empty());
+    let mut app = open(Pick { mode: Mode::Save, current_name: "x".into(), ..Default::default() });
+    select(&mut app, &["b.txt"]);
+    frame(&mut app, vec![]);
+    assert_eq!(app.picker.as_ref().unwrap().name, "b.txt");
+    // Several names for one folder; one of them taken.
+    let mut app = open(Pick { mode: Mode::SaveFiles, files: vec!["x.txt".into(), "keep.txt".into()], ..Default::default() });
+    assert_eq!(listed(&mut app), ["sub"], "a folder is chosen");
+    accept(&mut app);
+    let crate::popups::Popup::Choose { choices, .. } = std::mem::replace(&mut app.popup, crate::popups::Popup::None) else { panic!("asked to replace") };
+    (choices.into_iter().next().unwrap().2.unwrap())(&mut app);
+    assert_eq!(done(&app).map(|a| a.uris), Some(vec![uri(&d.join("x.txt")), uri(&d.join("keep.txt"))]));
+    // Cancel, and Escape.
+    let mut app = open(Pick::default());
+    cancel(&mut app);
+    assert_eq!(done(&app), Some(Answer::cancelled()));
+    let mut app = open(Pick::default());
+    frame(&mut app, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+    assert_eq!(done(&app).map(|a| a.response), Some(1), "Escape cancels");
+    // Escape clears a filter first.
+    let mut app = open(Pick::default());
+    app.tab().filter = "zz".into();
+    frame(&mut app, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+    assert!(done(&app).is_none() && app.tab().filter.is_empty());
+    let _ = crate::picker::ANSWER.lock().unwrap().take();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A tag's view finds what carries it under a folder, in any case, folders too, and
+/// skips what smart folders skip; the list sorts and groups by each item's first tag,
+/// colour labels in their order before the words, the untagged last either way round.
+#[test]
+fn tag_views_find_and_sort_by_the_first_tag() {
+    use crate::config::GroupBy;
+    use crate::tags;
+    let d = tmpdir("tagview");
+    for f in ["a.txt", "b.txt", "c.txt", "d.txt", "sub/e.txt", ".hidden/g.txt", "node_modules/h.txt"] {
+        touch(&d.join(f), "x");
+    }
+    std::fs::create_dir_all(d.join("sub/f")).unwrap();
+    if tags::write(&d.join("a.txt"), &["work".into()]).is_err() {
+        eprintln!("no user xattrs here: skipped");
+        return;
+    }
+    let set = |f: &str, t: &[&str]| tags::write(&d.join(f), &t.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+    set("b.txt", &["archive", "Blue"]);
+    set("c.txt", &["Red"]);
+    set("sub/e.txt", &["Work"]);
+    set("sub/f", &["work", "Gray"]);
+    set(".hidden/g.txt", &["work"]);
+    set("node_modules/h.txt", &["work"]);
+    let found = std::sync::Mutex::new(vec![]);
+    let (cancel, cut) = (std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false));
+    tags::search(&d, "WORK", &|b| {
+        found.lock().unwrap().extend(b.into_iter().map(|e| e.path.strip_prefix(&d).unwrap().to_path_buf()));
+        true
+    }, &cancel, &cut);
+    let mut found = found.into_inner().unwrap();
+    found.sort();
+    assert_eq!(found, [PathBuf::from("a.txt"), PathBuf::from("sub/e.txt"), PathBuf::from("sub/f")]);
+    // A file's first tag in the Tags order: Blue before the word "archive".
+    assert_eq!(tags::leading(&tags::read(&d.join("b.txt"))).map(String::as_str), Some("Blue"));
+    assert_eq!(tags::ordered(&["work".into(), "Gray".into(), "Red".into(), "archive".into()]), ["Red", "Gray", "archive", "work"]);
+    assert_eq!(tags::edited(&["a".into(), "b".into()], &tags::How::Rename("A".into(), "b".into())), ["b"], "renamed onto one it had");
+    // The listing, once the reader has every file's tags.
+    let stats = HashMap::new();
+    let ctx = egui::Context::default();
+    let mut t = Tab::new(92, d.clone(), ViewSettings::default(), ctx.clone());
+    let order = |t: &mut Tab, sort: SortKey, desc: bool, group: GroupBy| -> (Vec<String>, Vec<String>) {
+        t.settings.sort = sort;
+        t.settings.desc = desc;
+        t.settings.group = group;
+        let start = Instant::now();
+        loop {
+            t.dirty = true;
+            pump(t, &stats);
+            tags::flush(&ctx);
+            if t.entries.iter().all(|e| tags::get(&e.path, |_| ()).is_some()) || start.elapsed() > Duration::from_secs(5) {
+                t.dirty = true;
+                pump(t, &stats);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (t.view.iter().map(|&i| t.entries[i as usize].name.clone()).collect(), t.header_labels())
+    };
+    assert_eq!(order(&mut t, SortKey::Tags, false, GroupBy::None).0, ["node_modules", "sub", "c.txt", "b.txt", "a.txt", "d.txt"]);
+    assert_eq!(order(&mut t, SortKey::Tags, true, GroupBy::None).0, ["sub", "node_modules", "a.txt", "b.txt", "c.txt", "d.txt"], "untagged still last");
+    let (names, groups) = order(&mut t, SortKey::Name, false, GroupBy::Tag);
+    assert_eq!(groups, ["Red", "Blue", "work", "No tags"], "an item under its first tag only");
+    assert_eq!(names, ["c.txt", "b.txt", "a.txt", "node_modules", "sub", "d.txt"]);
+    // Every tag read so far, colour labels too, for the sidebar.
+    let mut known = vec!["work".to_string()];
+    assert!(tags::remember(&mut known));
+    for t in ["Red", "Blue", "archive", "Work"] {
+        assert!(known.iter().any(|k| k.eq_ignore_ascii_case(t)), "{t} known");
+    }
+    assert_eq!(known.iter().filter(|k| k.eq_ignore_ascii_case("work")).count(), 1, "one entry whatever the case");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A tag change is one change for Undo, however many files it touched: taken back and
+/// done again, only where each file's tags are still what the change left. Past a few
+/// hundred files it runs on a worker and is recorded when it ends.
+#[test]
+fn tag_changes_undo_and_redo_as_one() {
+    use crate::tags::{self, How, Job, Record};
+    let ctx = egui::Context::default();
+    let d = tmpdir("tagundo");
+    let files: Vec<PathBuf> = (0..3).map(|i| d.join(format!("f{i}.txt"))).collect();
+    for f in &files {
+        touch(f, "x");
+    }
+    if tags::write(&files[0], &["Red".into()]).is_err() {
+        eprintln!("no user xattrs here: skipped");
+        return;
+    }
+    let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+    app.undo_keep = crate::undofile::Keeper::new(None, &ctx);
+    let read = |f: &PathBuf| tags::read(f);
+    tags::start(&mut app, Job::Edit(files.clone(), How::Add("work".into())), Record::New("Tag 3 items work".into()));
+    assert_eq!(read(&files[0]), ["Red", "work"]);
+    assert_eq!(read(&files[2]), ["work"]);
+    assert_eq!((app.undo.len(), app.undo.last().map(|u| u.label.as_str())), (1, Some("Tag 3 items work")));
+    assert!(app.undo_last());
+    assert_eq!(read(&files[0]), ["Red"]);
+    assert!(read(&files[2]).is_empty() && app.undo.can_redo());
+    assert!(app.redo_last());
+    assert_eq!(read(&files[1]), ["work"]);
+    // Renamed everywhere, then one file changed by someone else before Undo: that one
+    // is left as it is.
+    tags::start(&mut app, Job::Edit(files.clone(), How::Rename("work".into(), "job".into())), Record::New("Rename tag “work” to “job”".into()));
+    assert_eq!(read(&files[0]), ["Red", "job"]);
+    tags::write(&files[1], &["job".into(), "mine".into()]).unwrap();
+    app.undo_last();
+    assert_eq!(read(&files[0]), ["Red", "work"]);
+    assert_eq!(read(&files[1]), ["job", "mine"], "changed since: left alone");
+    assert_eq!(app.undo.redos().last().map(|u| u.kind.count()), Some(2), "redo holds what was taken back");
+    // Many files: on a worker, one change when it ends.
+    let many: Vec<PathBuf> = (0..260).map(|i| d.join(format!("m/{i}.txt"))).collect();
+    for f in &many {
+        touch(f, "x");
+    }
+    let before = app.undo.len();
+    tags::start(&mut app, Job::Edit(many.clone(), How::Add("Green".into())), Record::New("Tag 260 items Green".into()));
+    app_until(&mut app, &ctx, "the tagging", |a| !tags::busy() && a.undo.len() == before + 1);
+    assert!(many.iter().all(|f| read(f) == ["Green"]));
+    assert_eq!(app.undo.last().map(|u| u.kind.count()), Some(260));
+    app.undo_last();
+    app_until(&mut app, &ctx, "the untagging", |_| !tags::busy() && read(&many[259]).is_empty());
+    assert!(many.iter().all(|f| read(f).is_empty()));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A JPEG with EXIF written the way a camera writes it: Orientation in IFD0, then
+/// DateTimeOriginal in the EXIF IFD it points to.
+/// The real ffmpeg and ffprobe on the PATH, linked into a stand-in folder; None when
+/// one is missing.
+pub(crate) fn media_tools(dir: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(dir).unwrap();
+    for t in ["ffmpeg", "ffprobe"] {
+        let real = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(t)).find(|m| m.is_file()))?;
+        let _ = std::os::unix::fs::symlink(real, dir.join(t));
+    }
+    Some(dir.to_path_buf())
+}
+
+pub(crate) fn with_exif_taken(jpeg: &[u8], orient: u16, taken: &str) -> Vec<u8> {
+    let mut t = b"MM\x00\x2a\x00\x00\x00\x08".to_vec();
+    let entry = |t: &mut Vec<u8>, tag: u16, kind: u16, n: u32, v: [u8; 4]| {
+        t.extend_from_slice(&tag.to_be_bytes());
+        t.extend_from_slice(&kind.to_be_bytes());
+        t.extend_from_slice(&n.to_be_bytes());
+        t.extend_from_slice(&v);
+    };
+    // IFD0 at 8: two entries (2 + 24 + 4 bytes), the EXIF IFD at 38.
+    t.extend_from_slice(&2u16.to_be_bytes());
+    let o = orient.to_be_bytes();
+    entry(&mut t, 0x0112, 3, 1, [o[0], o[1], 0, 0]);
+    entry(&mut t, 0x8769, 4, 1, 38u32.to_be_bytes());
+    t.extend_from_slice(&[0; 4]);
+    // EXIF IFD: one entry, its 20-byte date right after (38 + 2 + 12 + 4 = 56).
+    t.extend_from_slice(&1u16.to_be_bytes());
+    entry(&mut t, 0x9003, 2, 20, 56u32.to_be_bytes());
+    t.extend_from_slice(&[0; 4]);
+    t.extend_from_slice(taken.as_bytes());
+    t.push(0);
+    let mut app1 = b"Exif\x00\x00".to_vec();
+    app1.extend_from_slice(&t);
+    let mut out = jpeg[..2].to_vec();
+    out.extend_from_slice(&[0xff, 0xe1]);
+    out.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+/// Real pictures, films and recordings made by ImageMagick and ffmpeg: the date a photo
+/// was taken from its EXIF (a film's from its container), sizes from every header kind
+/// (a photo stored turned counted turned), lengths from ffprobe, read off the frame and
+/// kept on disk for the next time; the list sorts by each with the rest last either way
+/// round, and groups photos by month.
+#[test]
+fn media_facts_from_real_files_sort_and_group() {
+    use crate::config::GroupBy;
+    use crate::facts;
+    let _one = FACTS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    facts::focus(vec![]);
+    let d = tmpdir("facts");
+    let Some(tools) = media_tools(&d.join("tools")) else {
+        eprintln!("ffmpeg missing: skipped");
+        return;
+    };
+    let w = d.join("media");
+    std::fs::create_dir_all(&w).unwrap();
+    let run = |prog: &str, args: &[&str]| assert!(std::process::Command::new(tools.join(prog)).args(args).current_dir(&w).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success()), "{prog} {args:?}");
+    let ff = |args: &[&str]| run("ffmpeg", &[&["-hide_banner", "-loglevel", "error", "-y"], args].concat());
+    ff(&["-f", "lavfi", "-i", "testsrc=size=400x240", "-frames:v", "1", "raw.jpg"]);
+    let raw = std::fs::read(w.join("raw.jpg")).unwrap();
+    std::fs::write(w.join("turned.jpg"), with_exif_taken(&raw, 6, "2023:07:14 18:30:05")).unwrap();
+    std::fs::write(w.join("later.jpg"), with_exif_taken(&raw, 1, "2024:01:02 09:00:00")).unwrap();
+    std::fs::remove_file(w.join("raw.jpg")).unwrap();
+    // Both kinds of WebP: lossy (VP8) and lossless (VP8L).
+    for (f, size, extra) in [("wide.png", "300x20", ""), ("anim.gif", "64x48", ""), ("small.webp", "90x60", ""), ("flat.webp", "70x50", "-lossless 1"), ("old.bmp", "33x17", "")] {
+        let src = format!("testsrc=size={size}");
+        let mut a = vec!["-f", "lavfi", "-i", src.as_str(), "-frames:v", "1"];
+        a.extend(extra.split_whitespace());
+        a.push(f);
+        ff(&a);
+    }
+    ff(&["-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10", "-pix_fmt", "yuv420p", "-metadata", "creation_time=2024-05-01T10:00:00Z", "clip.mp4"]);
+    ff(&["-f", "lavfi", "-i", "sine=frequency=440:duration=3", "tone.flac"]);
+    touch(&w.join("notes.txt"), "x");
+    crate::drives::FAKE.with(|f| *f.borrow_mut() = Some(tools.clone()));
+    let ctx = egui::Context::default();
+    let stats = HashMap::new();
+    let mut t = Tab::new(93, w.clone(), ViewSettings::default(), ctx.clone());
+    let settle = |t: &mut Tab| {
+        let start = Instant::now();
+        loop {
+            t.dirty = true;
+            pump(t, &stats);
+            facts::flush(&ctx);
+            if t.entries.iter().all(|e| facts::get(e).is_some()) {
+                t.dirty = true;
+                pump(t, &stats);
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "facts read");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    t.settings.columns.push((crate::config::Column::Duration, 80.0));
+    settle(&mut t);
+    let of = |t: &Tab, n: &str| facts::get(t.entries.iter().find(|e| e.name == n).unwrap()).unwrap();
+    let local = |s: &str| crate::timefmt::parse_local(s).unwrap();
+    assert_eq!(of(&t, "turned.jpg"), facts::Facts { taken: Some(local("2023-07-14T18:30:05")), dims: Some((240, 400)), duration: None }, "stored turned, shown upright");
+    assert_eq!(of(&t, "later.jpg").dims, Some((400, 240)));
+    for (n, dims) in [("wide.png", (300, 20)), ("anim.gif", (64, 48)), ("small.webp", (90, 60)), ("flat.webp", (70, 50)), ("old.bmp", (33, 17))] {
+        assert_eq!(of(&t, n).dims, Some(dims), "{n}");
+    }
+    let clip = of(&t, "clip.mp4");
+    assert_eq!((clip.dims, clip.taken), (Some((320, 240)), Some(std::time::UNIX_EPOCH + Duration::from_secs(1_714_557_600))));
+    assert!((clip.duration.unwrap() - 2.0).abs() < 0.1 && (of(&t, "tone.flac").duration.unwrap() - 3.0).abs() < 0.1);
+    assert_eq!((of(&t, "tone.flac").dims, of(&t, "tone.flac").taken), (None, None), "a recording has no size nor date taken");
+    assert_eq!(of(&t, "notes.txt"), facts::Facts::default());
+    // Sorted by each, the rest after, whichever way round.
+    let names = |t: &mut Tab, k: SortKey, desc: bool| -> Vec<String> {
+        t.settings.sort = k;
+        t.settings.desc = desc;
+        settle(t);
+        t.view.iter().map(|&i| t.entries[i as usize].name.clone()).collect()
+    };
+    assert_eq!(&names(&mut t, SortKey::Duration, true)[..2], ["tone.flac", "clip.mp4"]);
+    assert_eq!(&names(&mut t, SortKey::Duration, false)[..2], ["clip.mp4", "tone.flac"]);
+    assert_eq!(&names(&mut t, SortKey::Taken, true)[..3], ["clip.mp4", "later.jpg", "turned.jpg"]);
+    assert_eq!(names(&mut t, SortKey::Dimensions, false), ["old.bmp", "anim.gif", "flat.webp", "small.webp", "wide.png", "clip.mp4", "later.jpg", "turned.jpg", "notes.txt", "tone.flac"]);
+    t.settings.group = GroupBy::Taken;
+    names(&mut t, SortKey::Name, false);
+    assert_eq!(t.header_labels(), ["May 2024", "January 2024", "July 2023", "No date"]);
+    // What ffprobe found is kept, by path, size and time changed.
+    let kept = std::fs::read_to_string(facts::kept_path()).unwrap();
+    assert!(kept.lines().any(|l| l.ends_with(&*w.join("clip.mp4").to_string_lossy()) && l.contains("\t320\t240\t")), "{kept}");
+    // A film changed is read again.
+    facts::invalidate(&w.join("clip.mp4"));
+    assert!(facts::get(t.entries.iter().find(|e| e.name == "clip.mp4").unwrap()).is_none(), "asked again");
+    settle(&mut t);
+    crate::drives::FAKE.with(|f| *f.borrow_mut() = None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The folders shown are one setting for the whole process: one test at a time.
+static FACTS_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A probe for a folder no longer shown is killed, and the file is asked for again
+/// when its folder is shown again. A stand-in ffprobe that hangs, writing its pid.
+#[test]
+fn media_probes_stop_when_their_folder_is_left() {
+    use crate::facts;
+    let _one = FACTS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tmpdir("factsgone");
+    let fake = d.join("tools");
+    std::fs::create_dir_all(&fake).unwrap();
+    let pidf = d.join("pid");
+    std::fs::write(fake.join("ffprobe"), format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pidf.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(fake.join("ffprobe"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let here = d.join("films");
+    touch(&here.join("long.mkv"), "not really");
+    crate::drives::FAKE.with(|f| *f.borrow_mut() = Some(fake.clone()));
+    facts::focus(vec![here.clone()]);
+    let e = crate::fsx::Entry::from_path(&here.join("long.mkv")).unwrap();
+    assert!(facts::get(&e).is_none());
+    facts::flush(&egui::Context::default());
+    let t0 = Instant::now();
+    while !pidf.exists() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "probe started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = std::fs::read_to_string(&pidf).unwrap().trim().parse::<i32>().unwrap();
+    facts::focus(vec![d.join("elsewhere")]);
+    let t0 = Instant::now();
+    while unsafe { libc::kill(pid, 0) } == 0 && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z ")) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "probe killed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Not taken for an answer: shown again, it is asked for again.
+    std::thread::sleep(Duration::from_millis(100));
+    facts::focus(vec![here.clone()]);
+    assert!(facts::get(&e).is_none());
+    facts::focus(vec![]);
+    crate::drives::FAKE.with(|f| *f.borrow_mut() = None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// git in `d` as one fixed person at one fixed time of day `day` of September 2026, so
+/// the commits (and their hashes) come out the same every run.
+fn git_on(d: &Path, day: u32, args: &[&str]) {
+    let date = format!("2026-09-{day:02}T10:00:00+00:00");
+    let ok = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", "-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .current_dir(d)
+        .env("GIT_AUTHOR_NAME", "Ada Lovelace")
+        .env("GIT_AUTHOR_EMAIL", "ada@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+        .env("GIT_COMMITTER_EMAIL", "ada@example.invalid")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "git {args:?}");
+}
+
+/// What the history's find bar makes of its text: plain words, "quoted words", the
+/// `author:`, `path:`, `since:` and `until:` terms (half typed ones ignored, a date form
+/// that isn't one kept as a word), case only when a word has capitals, git's flags, what
+/// a row marks, and the text a search starts with in a subfolder.
+#[test]
+fn git_search_text_read() {
+    use crate::gitfind::{hash_hit, parse, spans, start_text};
+    let now = 1_790_000_000;
+    let q = parse("fix  \"two words\" author:ada path:./src/ui/ since:7d until:2026-09 author: path:", now);
+    assert_eq!(q.words, ["fix", "two words"]);
+    assert_eq!((q.authors.as_slice(), q.paths.as_slice()), (&["ada".to_string()][..], &["src/ui".to_string()][..]));
+    assert_eq!(q.since, Some(now - 7 * 86_400));
+    let oct = crate::timefmt::parse_local("2026-10-01T00:00:00").map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64).unwrap();
+    assert_eq!(q.until, Some(oct - 1), "the whole of September");
+    assert!(!q.case, "a capital in a path or a date says nothing");
+    assert_eq!(q.flags(), ["--fixed-strings", "--regexp-ignore-case", "--author=ada", &format!("--since=@{}", now - 7 * 86_400), &format!("--until=@{}", oct - 1)]);
+    assert!(parse("Fix", now).case && parse("author:Ada", now).case && !parse("path:README.md fix", now).case);
+    assert_eq!(parse("until:3d", now).until, Some(now - 3 * 86_400), "an age's moment itself");
+    assert_eq!(parse("since:soon", now).words, ["since:soon"], "not a date: a word");
+    assert_eq!(parse("Author:\"Grace Hopper\"", now).authors, ["Grace Hopper"]);
+    assert!(parse("  author: path:/ ", now).is_empty(), "nothing to look for yet");
+    assert!(parse("", now).flags().is_empty());
+    let q = parse("pan panel lay", now);
+    assert_eq!(spans(&q, "Lay out the panels", false), [(0, 3), (12, 17)], "overlaps joined");
+    let q = parse("grace author:hop", now);
+    assert_eq!((spans(&q, "Grace Hopper", true), spans(&q, "Grace Hopper", false)), (vec![(0, 5), (6, 9)], vec![(0, 5)]));
+    let q = parse("1a2B", now);
+    assert_eq!((hash_hit(&q, "1a2b3c4d"), hash_hit(&q, "ffff1a2b"), hash_hit(&parse("1a2", now), "1a2b")), (4, 0, 0), "four hex digits at least, from the start");
+    assert_eq!((start_text("src/ui"), start_text(""), start_text("my notes/"), start_text(".")), ("path:src/ui ".to_string(), String::new(), "path:\"my notes\" ".to_string(), String::new()));
+}
+
+/// Commits found as the history's search finds them: git run with the flags the view
+/// gives it, its output read as the view reads it. Words are looked for in the subject,
+/// the rest of the message, the author and their email and the hash; the terms narrow in
+/// git; a file's history keeps to its file.
+#[test]
+fn git_history_search_finds_commits() {
+    use std::io::BufRead;
+    if !crate::media::have("git") {
+        return;
+    }
+    let d = tmpdir("gitsearch");
+    commit_view_fixture(&d);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let read = |path: Option<&str>, text: &str, n: usize| -> (Vec<String>, bool) {
+        let q = crate::gitfind::parse(text, now);
+        let mut child = std::process::Command::new("git").arg("-C").arg(&d).args(crate::gitlog::list_args(path, Some(&q))).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut r = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut got = vec![];
+        let end = crate::gitlog::read_matching(&mut r, n, &q, |v| got.extend(v));
+        drop(r.fill_buf().map(|_| ()));
+        let _ = child.kill();
+        let _ = child.wait();
+        (got.into_iter().map(|c| c.subject).collect(), end)
+    };
+    let found = |text: &str| read(None, text, usize::MAX).0;
+    let all = ["Tune the panel", "Remove the logo", "Write the long notes", "Lay out the panels", "Start the project"];
+    assert_eq!(found("panels"), ["Lay out the panels"]);
+    assert_eq!(found("Panels"), Vec::<String>::new(), "a capital matches case");
+    assert_eq!(found("handbook"), ["Lay out the panels"], "in the message under the subject");
+    assert_eq!(found("grace"), ["Tune the panel", "Lay out the panels"], "the author's name");
+    assert_eq!(found("linus@example"), ["Write the long notes"], "their email");
+    assert_eq!(found("panel grace"), ["Tune the panel", "Lay out the panels"], "every word, each anywhere");
+    assert_eq!(found("\"long notes\""), ["Write the long notes"]);
+    assert_eq!(found("zzz"), Vec::<String>::new());
+    let logo = git_said(&d, &["log", "-1", "--format=%H", "--grep=Remove the logo"]);
+    assert_eq!(found(&logo[..6]), ["Remove the logo"], "the start of its hash");
+    assert_eq!(found("author:ada"), ["Remove the logo", "Start the project"]);
+    assert_eq!(found("author:ADA"), Vec::<String>::new());
+    assert_eq!(found("author:\"Grace Hopper\" author:linus"), ["Tune the panel", "Write the long notes", "Lay out the panels"], "any of several");
+    assert_eq!(found("path:notes.md"), ["Write the long notes", "Start the project"]);
+    assert_eq!(found("path:assets"), ["Remove the logo", "Lay out the panels", "Start the project"], "a folder");
+    assert_eq!(found("path:./src/ui/"), ["Tune the panel", "Lay out the panels", "Start the project"]);
+    assert_eq!(found("author:grace path:src"), ["Tune the panel", "Lay out the panels"]);
+    assert_eq!(found("since:2026-09-04"), ["Tune the panel", "Remove the logo"]);
+    assert_eq!(found("until:2026-09-02"), ["Lay out the panels", "Start the project"]);
+    assert_eq!(found("since:2026-09-02 until:2026-09-03 the"), ["Write the long notes", "Lay out the panels"]);
+    assert_eq!((found("since:1d"), found("until:1d")), (vec![], all.map(String::from).to_vec()), "ages count back from now");
+    // A file's history searched: its own commits only, other paths left out.
+    assert_eq!(read(Some("src/ui/panel.rs"), "tune", usize::MAX).0, ["Tune the panel"]);
+    assert_eq!(read(Some("src/ui/panel.rs"), "path:assets", usize::MAX).0, ["Tune the panel", "Lay out the panels"]);
+    // A page of one: the reader stops there, the log not ended.
+    assert_eq!(read(None, "the", 1), (vec!["Tune the panel".to_string()], false));
+    assert_eq!(read(None, "the", 10), (all.map(String::from).to_vec(), true));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A repository for comparing: main and topic split after "Start"; topic changes the
+/// notes, adds a file and changes the picture, main adds a readme.
+pub(crate) fn branches_fixture(d: &Path) {
+    std::fs::create_dir_all(d).unwrap();
+    git_on(d, 1, &["init", "-q"]);
+    touch(&d.join("notes.txt"), "one\ntwo\nthree\n");
+    std::fs::write(d.join("pic.png"), png_bytes(20, 10, 1)).unwrap();
+    git_on(d, 1, &["add", "-A"]);
+    git_on(d, 1, &["commit", "-qm", "Start"]);
+    git_on(d, 2, &["switch", "-qc", "topic"]);
+    touch(&d.join("notes.txt"), "one\nTWO on topic\nthree\n");
+    git_on(d, 2, &["commit", "-qam", "Topic edits the notes"]);
+    touch(&d.join("extra.txt"), "more\n");
+    git_on(d, 3, &["add", "-A"]);
+    git_on(d, 3, &["commit", "-qm", "Topic adds a file"]);
+    std::fs::write(d.join("pic.png"), png_bytes(30, 12, 2)).unwrap();
+    git_on(d, 4, &["commit", "-qam", "Topic redraws the picture"]);
+    git_on(d, 5, &["switch", "-q", "main"]);
+    touch(&d.join("readme.md"), "# Read me\n");
+    git_on(d, 5, &["add", "-A"]);
+    git_on(d, 5, &["commit", "-qm", "Main gets a readme"]);
+}
+
+/// Two branches compared: the commits only each has, where they split, the files topic
+/// changes since then (and every difference, main's readme included), a file's diff and
+/// the picture's two sides as the commit view reads them; two commits on one line put
+/// older first; a name git doesn't know, and two histories with nothing in common.
+#[test]
+fn git_compare_branches_and_commits() {
+    use crate::gitcompare::{heading, sides};
+    if !crate::media::have("git") {
+        return;
+    }
+    let d = tmpdir("gitcompare");
+    branches_fixture(&d);
+    let rev = |r: &str| git_said(&d, &["rev-parse", r]);
+    let subjects = |v: &[crate::gitlog::Commit]| v.iter().map(|c| c.subject.clone()).collect::<Vec<_>>();
+    let s = sides(&d, "main", "topic", false).unwrap();
+    assert_eq!((s.hashes.clone(), s.base.clone(), s.counts, s.swapped), ([rev("main"), rev("topic")], Some(rev("main~1")), [1, 3], false));
+    assert_eq!(subjects(&s.only[0]), ["Main gets a readme"]);
+    assert_eq!(subjects(&s.only[1]), ["Topic redraws the picture", "Topic adds a file", "Topic edits the notes"]);
+    let names = |v: &[crate::gitlog::Change]| v.iter().map(|c| (c.status as char, c.path.clone(), c.lines)).collect::<Vec<_>>();
+    let base = s.base.clone().unwrap();
+    let since = crate::gitlog::files(&d, &base, &s.hashes[1]);
+    assert_eq!(names(&since), [('A', "extra.txt".into(), Some((1, 0))), ('M', "notes.txt".into(), Some((1, 1))), ('M', "pic.png".into(), None)]);
+    let every = crate::gitlog::files(&d, &s.hashes[0], &s.hashes[1]);
+    assert_eq!(names(&every).iter().map(|x| (x.0, x.1.as_str())).collect::<Vec<_>>(), [('A', "extra.txt"), ('M', "notes.txt"), ('M', "pic.png"), ('D', "readme.md")]);
+    let parents = [base.clone()];
+    let notes = since.iter().find(|c| c.path == "notes.txt").unwrap();
+    assert_eq!(crate::gitlog::diff(&d, &s.hashes[1], &parents, notes).0, ["@@ -1,3 +1,3 @@", " one", "-two", "+TWO on topic", " three"]);
+    let pic = since.iter().find(|c| c.path == "pic.png").unwrap();
+    let side = |old| crate::gitlog::picture_side(&d, &s.hashes[1], &parents, pic, old, 64).map(|p| p.1);
+    assert_eq!((side(true), side(false)), (Some([20, 10]), Some([30, 12])), "before and after");
+    // Commits on one line: the older is the old side, whichever was marked first.
+    let s = sides(&d, &rev("topic"), &rev("main~1"), true).unwrap();
+    assert_eq!((s.hashes.clone(), s.counts, s.swapped, s.base.clone()), ([rev("main~1"), rev("topic")], [0, 3], true, Some(rev("main~1"))));
+    let s = sides(&d, &rev("topic"), &rev("main~1"), false).unwrap();
+    assert_eq!((s.counts, s.swapped), ([3, 0], false), "a branch compared as asked");
+    assert_eq!(sides(&d, "main", "nope", false).err().as_deref(), Some("git doesn't know nope"));
+    git_on(&d, 6, &["switch", "-q", "--orphan", "lone"]);
+    touch(&d.join("lone.txt"), "alone\n");
+    git_on(&d, 6, &["add", "lone.txt"]);
+    git_on(&d, 6, &["commit", "-qm", "Alone"]);
+    let s = sides(&d, "main", "lone", false).unwrap();
+    assert_eq!((s.base.clone(), s.counts), (None, [2, 1]), "no history in common");
+    assert_eq!((heading(0, "x"), heading(1, "main"), heading(1200, "topic")), ("Nothing only on x".to_string(), "1 commit only on main".to_string(), "1,200 commits only on topic".to_string()));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Merging a branch into the one HEAD is on: a fast-forward, nothing to merge, a merge
+/// commit with git's own message, git's refusals in plain words (changes or untracked
+/// files in the way, a name it doesn't know, no history in common, a merge still going),
+/// conflicts given up on and then settled and finished, `merge.ff` honoured, and the
+/// merge taken back by a reset to the commit it says it was at.
+#[test]
+fn git_merge_into_the_current_branch() {
+    use crate::gitsync::{CONFLICTS, Doing, Side, doing};
+    use crate::gitwork::{Op, run};
+    if !crate::media::have("git") {
+        return;
+    }
+    let d = tmpdir("gitmerge");
+    work_repo(&d);
+    git(&d, &["config", "merge.ff", "true"]);
+    let commit = |day: u32, file: &str, text: &str, msg: &str| {
+        touch(&d.join(file), text);
+        git_on(&d, day, &["add", "-A"]);
+        git_on(&d, day, &["commit", "-qm", msg]);
+    };
+    let rev = |r: &str| git_said(&d, &["rev-parse", r]);
+    let short = |h: &str| h[..7].to_string();
+    let merge = |b: &str| run(&d, &Op::Merge(b.into()));
+    commit(1, "notes.txt", "one\ntwo\nthree\n", "Start");
+    let start = rev("HEAD");
+    git(&d, &["switch", "-qc", "topic"]);
+    commit(2, "a.txt", "a\n", "Add a");
+    git(&d, &["switch", "-q", "main"]);
+    assert_eq!(merge("topic").unwrap(), format!("Fast-forwarded main to topic · it was at {}", short(&start)));
+    assert_eq!(rev("HEAD"), rev("topic"));
+    assert_eq!(merge("topic").unwrap(), "main already has everything on topic");
+    // Both moved on: a merge commit, git's message, no editor.
+    git(&d, &["switch", "-q", "topic"]);
+    commit(3, "b.txt", "b\n", "Add b");
+    git(&d, &["switch", "-q", "main"]);
+    commit(3, "c.txt", "c\n", "Add c");
+    let before = rev("HEAD");
+    assert_eq!(merge("topic").unwrap(), format!("Merged topic into main · it was at {}", short(&before)));
+    assert_eq!(git_said(&d, &["log", "-1", "--format=%P"]).split_whitespace().count(), 2);
+    assert_eq!(git_said(&d, &["log", "-1", "--format=%s"]), "Merge branch 'topic'");
+    assert!(d.join("b.txt").exists() && d.join("c.txt").exists());
+    // Taken back: the reset the commit menu offers, to the commit it was at.
+    run(&d, &Op::Reset { to: before.clone(), hard: true }).unwrap();
+    assert_eq!((rev("HEAD"), d.join("b.txt").exists()), (before.clone(), false));
+    // Refused: a change of its own in the way, then a file git doesn't track.
+    git(&d, &["switch", "-q", "topic"]);
+    commit(4, "notes.txt", "one\ntwo from topic\nthree\n", "Topic's two");
+    commit(4, "new.txt", "new\n", "Topic's new file");
+    git(&d, &["switch", "-q", "main"]);
+    touch(&d.join("notes.txt"), "one\ntwo, not committed\nthree\n");
+    assert_eq!(merge("topic").unwrap_err(), "Your uncommitted changes to notes.txt would be overwritten by the merge. Commit or stash them first.");
+    assert_eq!((doing(&d), std::fs::read_to_string(d.join("notes.txt")).unwrap(), rev("HEAD")), (None, "one\ntwo, not committed\nthree\n".to_string(), before.clone()));
+    git(&d, &["checkout", "--", "notes.txt"]);
+    touch(&d.join("new.txt"), "mine\n");
+    assert_eq!(merge("topic").unwrap_err(), "The merge would overwrite new.txt, which git doesn't track. Move them away or commit them first.");
+    std::fs::remove_file(d.join("new.txt")).unwrap();
+    assert_eq!(merge("nope").unwrap_err(), "git doesn't know nope.");
+    // Conflicts: given up on, everything as before.
+    commit(5, "notes.txt", "one\ntwo from main\nthree\n", "Main's two");
+    let ours = rev("HEAD");
+    assert_eq!(merge("topic").unwrap_err(), CONFLICTS);
+    assert_eq!((doing(&d), work_of(&d).doing), (Some(Doing::Merge), Some(Doing::Merge)));
+    assert!(Op::Merge("topic".into()).moved(&Err(CONFLICTS.into())), "the history reads its new state");
+    assert_eq!(merge("topic").unwrap_err(), "Merging is still in progress: continue or abort it on the Changes page first.");
+    assert_eq!(run(&d, &Op::Continue).unwrap_err(), "Some files are still in conflict.");
+    assert_eq!(run(&d, &Op::Abort).unwrap(), "Stopped merging and went back");
+    assert_eq!((doing(&d), rev("HEAD"), std::fs::read_to_string(d.join("notes.txt")).unwrap()), (None, ours.clone(), "one\ntwo from main\nthree\n".to_string()));
+    // Again, settled with theirs and finished: the commit has git's message.
+    assert_eq!(merge("topic").unwrap_err(), CONFLICTS);
+    assert!(crate::gitsync::conflicts(&std::fs::read_to_string(d.join("notes.txt")).unwrap()).len() == 1);
+    run(&d, &Op::Settle { path: "notes.txt".into(), at: 0, side: Side::Theirs }).unwrap();
+    assert_eq!(run(&d, &Op::Continue).unwrap(), "Finished the merge");
+    assert_eq!((doing(&d), git_said(&d, &["log", "-1", "--format=%s"])), (None, "Merge branch 'topic'".to_string()));
+    assert_eq!(std::fs::read_to_string(d.join("notes.txt")).unwrap(), "one\ntwo from topic\nthree\n");
+    assert!(d.join("new.txt").exists());
+    // git's own setting asks for a merge commit even when a fast-forward would do.
+    git(&d, &["switch", "-qc", "later"]);
+    commit(6, "d.txt", "d\n", "Add d");
+    git(&d, &["switch", "-q", "main"]);
+    git(&d, &["config", "merge.ff", "false"]);
+    let at = rev("HEAD");
+    assert_eq!(merge("later").unwrap(), format!("Merged later into main · it was at {}", short(&at)));
+    assert_eq!(git_said(&d, &["log", "-1", "--format=%P"]), format!("{at} {}", rev("later")));
+    // Nothing in common.
+    git(&d, &["switch", "-q", "--orphan", "lone"]);
+    commit(7, "lone.txt", "alone\n", "Alone");
+    git(&d, &["switch", "-q", "main"]);
+    assert_eq!(merge("lone").unwrap_err(), "lone and main have no history in common, so git won't merge them.");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A remote branch merged in: fetched from a real bare repository, fast-forwarded to,
+/// then merged with a commit once both sides have moved on.
+#[test]
+fn git_merge_a_remote_branch() {
+    use crate::gitwork::{Op, run};
+    if !crate::media::have("git") {
+        return;
+    }
+    let (d, a, b) = sync_fixture("gitmergeremote");
+    git(&a, &["switch", "-qc", "topic"]);
+    touch(&a.join("t.txt"), "topic\n");
+    git(&a, &["add", "-A"]);
+    git(&a, &["commit", "-qm", "Topic work"]);
+    git(&a, &["push", "-q", "-u", "origin", "topic"]);
+    git(&b, &["config", "merge.ff", "true"]);
+    run(&b, &Op::Fetch).unwrap();
+    let was = git_said(&b, &["rev-parse", "--short=7", "HEAD"]);
+    assert_eq!(run(&b, &Op::Merge("origin/topic".into())).unwrap(), format!("Fast-forwarded main to origin/topic · it was at {was}"));
+    assert!(b.join("t.txt").exists());
+    touch(&a.join("t2.txt"), "more\n");
+    git(&a, &["add", "-A"]);
+    git(&a, &["commit", "-qm", "More topic work"]);
+    git(&a, &["push", "-q"]);
+    touch(&b.join("b.txt"), "b\n");
+    git(&b, &["add", "-A"]);
+    git(&b, &["commit", "-qm", "B's own"]);
+    run(&b, &Op::Fetch).unwrap();
+    let was = git_said(&b, &["rev-parse", "--short=7", "HEAD"]);
+    assert_eq!(run(&b, &Op::Merge("origin/topic".into())).unwrap(), format!("Merged origin/topic into main · it was at {was}"));
+    assert_eq!(git_said(&b, &["log", "-1", "--format=%s"]), "Merge remote-tracking branch 'origin/topic'");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Let a Columns tab and its strip's listings land, sorting as the view does.
+fn strip_settle(t: &mut Tab, hidden: bool) {
+    let (stats, recents) = (HashMap::new(), HashSet::new());
+    let c = ViewCtx { show_hidden: hidden, show_system: false, folders_first: true, recents_on_top: false, recents: &recents, stats: &stats };
+    let start = Instant::now();
+    loop {
+        t.poll();
+        if t.dirty {
+            t.rebuild(&c);
+        }
+        crate::columns::sync(t, &c);
+        let busy = t.is_loading() || t.strip.as_ref().is_some_and(|s| s.cols.iter().any(|c| c.tab.is_loading()) || s.preview.as_ref().is_some_and(|p| s.get(p).is_none()));
+        if !busy {
+            crate::columns::sync(t, &c);
+            return;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "the strip's listings never landed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn col_names(t: &Tab, dir: &Path) -> Vec<String> {
+    let st = t.strip.as_ref().expect("a strip");
+    let col = &st.get(dir).unwrap_or_else(|| panic!("no column for {}", dir.display())).tab;
+    col.view.iter().map(|&i| col.entries[i as usize].name.clone()).collect()
+}
+
+#[test]
+fn columns_start_at_home_or_the_root() {
+    let home = crate::fsx::home();
+    assert_eq!(crate::columns::root_for(&home.join("Documents/Taxes")), home);
+    assert_eq!(crate::columns::root_for(&home), home);
+    if !Path::new("/proc").starts_with(&home) {
+        assert_eq!(crate::columns::root_for(Path::new("/proc/self")), PathBuf::from("/"));
+    }
+    let chain = crate::columns::chain(Path::new("/h"), Path::new("/h/a/b"));
+    assert_eq!(chain, vec![PathBuf::from("/h"), PathBuf::from("/h/a"), PathBuf::from("/h/a/b")]);
+    // Inside an archive the folders go on past the archive's name.
+    let chain = crate::columns::chain(Path::new("/h"), Path::new("/h/x.zip/docs"));
+    assert_eq!(chain.last(), Some(&PathBuf::from("/h/x.zip/docs")));
+    assert_eq!(chain.len(), 3);
+}
+
+#[test]
+fn columns_strip_lists_the_way_down() {
+    let d = tmpdir("columns");
+    touch(&d.join("a/b/c/deep.txt"), "x");
+    touch(&d.join("a/b/note.txt"), "x");
+    touch(&d.join("a/zz.txt"), "x");
+    touch(&d.join("a/y/keep.txt"), "x");
+    touch(&d.join("a/.hid/inner/x.txt"), "x");
+    let v = ViewSettings { column_view: true, ..Default::default() };
+    let mut t = Tab::new(1, d.join("a/b"), v, egui::Context::default());
+    strip_settle(&mut t, false);
+    let st = t.strip.as_ref().unwrap();
+    assert!(st.chain.ends_with(&[d.clone(), d.join("a")]), "the folders above, the root first: {:?}", st.chain);
+    // The column above lists its folder like the tab would, the way down marked.
+    assert_eq!(col_names(&t, &d.join("a")), vec!["b", "y", "zz.txt"], "hidden left out, folders first, by name");
+    let a = &st.get(&d.join("a")).unwrap().tab;
+    assert_eq!(st.get(&d.join("a")).unwrap().child.map(|i| a.entries[i as usize].name.as_str()), Some("b"));
+    // The cursor rests on c: its listing is the next column.
+    assert_eq!(t.cursor_path(), Some(d.join("a/b/c")));
+    assert_eq!(st.preview, Some(d.join("a/b/c")));
+    assert_eq!(col_names(&t, &d.join("a/b/c")), vec!["deep.txt"]);
+    // A file under the cursor has nothing after it, nor has a selection of several.
+    t.move_cursor(1, false, false);
+    strip_settle(&mut t, false);
+    assert_eq!(t.cursor_path(), Some(d.join("a/b/note.txt")));
+    assert_eq!(t.strip.as_ref().unwrap().preview, None);
+    t.move_cursor(-1, true, false);
+    strip_settle(&mut t, false);
+    assert_eq!(t.selected.len(), 2);
+    assert_eq!(t.strip.as_ref().unwrap().preview, None, "two picked: no next column");
+    // The columns follow the tab's sort, never its grouping.
+    t.settings.desc = true;
+    t.settings.group = crate::config::GroupBy::Type;
+    strip_settle(&mut t, false);
+    assert_eq!(col_names(&t, &d.join("a")), vec!["y", "b", "zz.txt"], "descending, folders still first");
+    assert!(t.strip.as_ref().unwrap().cols.iter().all(|c| c.tab.settings.group == crate::config::GroupBy::None));
+    t.settings.desc = false;
+    // Going up, the folder left keeps its column filled and the one above shows at once:
+    // the tab has its listing before its own read lands.
+    t.up(|_| None);
+    assert!(t.entries.is_empty(), "a fresh read is under way");
+    let (stats, recents) = (HashMap::new(), HashSet::new());
+    let c = ViewCtx { show_hidden: false, show_system: false, folders_first: true, recents_on_top: false, recents: &recents, stats: &stats };
+    crate::columns::sync(&mut t, &c);
+    assert_eq!(t.path, d.join("a"));
+    assert!(!t.view.is_empty(), "the column's listing stands in");
+    assert_eq!(t.cursor_path(), Some(d.join("a/b")), "on the folder come from");
+    assert_eq!(t.strip.as_ref().unwrap().preview, Some(d.join("a/b")));
+    assert!(col_names(&t, &d.join("a/b")).contains(&"note.txt".to_string()), "the folder left is still listed beside");
+    strip_settle(&mut t, false);
+    // A hidden folder on the way down shows in its column even with hidden files off.
+    t.navigate(d.join("a/.hid/inner"), None);
+    strip_settle(&mut t, false);
+    let names = col_names(&t, &d.join("a"));
+    assert!(names.contains(&".hid".to_string()) && !names.contains(&".hidden".to_string()), "{names:?}");
+    assert_eq!(names.iter().position(|n| n == ".hid"), Some(0), "among the folders by name");
+    // A change Maia made reads the column again.
+    std::fs::write(d.join("a/new.txt"), "x").unwrap();
+    t.changed(&crate::ops::Changed { arrived: vec![d.join("a")], left: vec![], gone: vec![] });
+    strip_settle(&mut t, false);
+    assert!(col_names(&t, &d.join("a")).contains(&"new.txt".to_string()), "the column above caught the new file");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn columns_stay_through_a_saved_view() {
+    let d = tmpdir("colsaved");
+    for n in ["a", "b"] {
+        std::fs::create_dir_all(d.join(n)).unwrap();
+    }
+    let ctx = egui::Context::default();
+    let mut t = Tab::new(1, d.clone(), ViewSettings { column_view: true, ..Default::default() }, ctx.clone());
+    let saved = ViewSettings { sort: SortKey::Modified, zoom: 0.65, ..Default::default() };
+    t.navigate(d.join("a"), Some((saved, Some(crate::config::SaveScope::ThisFolder))));
+    assert!(t.settings.column_view, "walked into, a folder's saved view keeps the columns");
+    assert_eq!(t.settings.sort, SortKey::Modified, "and lends them its sort");
+    t.navigate(d.join("b"), None);
+    assert!(t.settings.column_view);
+    assert_eq!(t.settings.sort, SortKey::Name, "the view of before, back");
+    // Columns saved for a folder: shown there, and the view of before after it.
+    let mut t = Tab::new(2, d.clone(), ViewSettings::default(), ctx);
+    t.navigate(d.join("a"), Some((ViewSettings { column_view: true, ..Default::default() }, Some(crate::config::SaveScope::ThisFolder))));
+    assert!(t.settings.column_view);
+    assert!(!t.tree_active(), "no tree under the columns");
+    t.navigate(d.join("b"), None);
+    assert!(!t.settings.column_view, "out of the folder, Details again");
+    // Settings written before Columns existed read as not Columns.
+    let old: ViewSettings = serde_json::from_str(r#"{"zoom":0.1,"sort":"Name"}"#).unwrap();
+    assert!(!old.column_view && crate::listing::mode_of(&old) == crate::listing::Mode::Tree);
+    let new: ViewSettings = serde_json::from_str(r#"{"zoom":0.1,"column_view":true}"#).unwrap();
+    assert_eq!(crate::listing::mode_of(&new), crate::listing::Mode::Columns);
+    assert_eq!(crate::listing::view_label(&new), "Columns");
+    // Its key, the next free one after the six views on the zoom axis.
+    let km = Keymap::build(&Default::default());
+    assert_eq!(km.lookup(&commands::parse_binding("Ctrl+Shift+7").unwrap()).0, Some(Cmd::ViewColumns));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// One frame with these input events (keys, typed text).
+fn app_input(app: &mut crate::app::App, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), events, focused: true, ..Default::default() };
+    let _ = ctx.run(raw, |c| app.frame(c));
+}
+
+fn press(key: egui::Key) -> egui::Event {
+    egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+}
+
+/// The Go To picker of Copy To… / Move To…, and what it holds.
+fn dest_picker(app: &crate::app::App) -> Option<&crate::popups::GoToState> {
+    match &app.popup {
+        crate::popups::Popup::GoTo(st) if st.dest.is_some() => Some(st),
+        _ => None,
+    }
+}
+
+/// The cursor on `name` and nothing else selected, once the folder is listed.
+fn pick_entry(app: &mut crate::app::App, ctx: &egui::Context, name: &str) {
+    app_until(app, ctx, "the listing", |a| a.panels[&a.active].tab().entries.iter().any(|e| e.name == name));
+    let t = app.tab();
+    let i = t.entries.iter().position(|e| e.name == name).unwrap() as u32;
+    t.select_only(i);
+}
+
+/// Copy To… and Move To… through the picker as it is typed into: a path typed down to
+/// its folder lands there, the folder is remembered and comes first next time, Enter
+/// on it moves, and Undo takes each back. Real files, real jobs.
+#[test]
+fn copy_to_and_move_to_through_the_picker() {
+    let ctx = egui::Context::default();
+    let d = tmpdir("copyto");
+    touch(&d.join("a.txt"), "a");
+    touch(&d.join("b.txt"), "b");
+    touch(&d.join("box/old.txt"), "old");
+    let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+    app.ud.destinations.clear();
+    pick_entry(&mut app, &ctx, "a.txt");
+    app.run(Cmd::CopyTo);
+    app_frame(&mut app, &ctx);
+    let st = dest_picker(&app).expect("Go To opens to pick the destination");
+    assert_eq!(st.dest.as_ref().unwrap().title(), "Copy “a.txt” to…");
+    assert!(st.items.iter().all(|i| i.header || i.is_dir), "only folders are offered");
+    assert!(!st.items.iter().any(|i| i.header && i.label == "Recent destinations"), "nothing sent anywhere yet");
+    // Typed down to the folder: the folder itself is the first row.
+    app_input(&mut app, &ctx, vec![egui::Event::Text(format!("{}/box/", d.display()))]);
+    app_until(&mut app, &ctx, "the folder read", |a| dest_picker(a).is_some_and(|st| st.items.first().is_some_and(|i| i.path == d.join("box"))));
+    app_input(&mut app, &ctx, vec![press(egui::Key::Enter)]);
+    assert!(dest_picker(&app).is_none(), "Enter starts it and closes the picker");
+    app_until(&mut app, &ctx, "the copy", |a| d.join("box/a.txt").exists() && a.jobs.iter().all(|j| j.finished_at.is_some()) && !a.undo.is_empty());
+    assert!(d.join("a.txt").exists(), "a copy leaves the original");
+    assert_eq!(app.ud.destinations, vec![d.join("box")], "remembered");
+    // Move To…: the folder used last heads the list, already highlighted.
+    pick_entry(&mut app, &ctx, "b.txt");
+    app.run(Cmd::MoveTo);
+    app_frame(&mut app, &ctx);
+    app_frame(&mut app, &ctx);
+    let st = dest_picker(&app).unwrap();
+    assert_eq!(st.dest.as_ref().unwrap().title(), "Move “b.txt” to…");
+    assert!(st.items[0].header && st.items[0].label == "Recent destinations", "recent destinations first");
+    assert_eq!(st.items[1].path, d.join("box"));
+    assert_eq!(st.sel, 1, "the newest one highlighted");
+    app_input(&mut app, &ctx, vec![press(egui::Key::Enter)]);
+    app_until(&mut app, &ctx, "the move", |a| d.join("box/b.txt").exists() && !d.join("b.txt").exists() && a.jobs.iter().all(|j| j.finished_at.is_some()));
+    assert!(app.undo_last());
+    app_until(&mut app, &ctx, "the move undone", |_| d.join("b.txt").exists() && !d.join("box/b.txt").exists());
+    // Esc leaves everything as it was.
+    pick_entry(&mut app, &ctx, "b.txt");
+    app.run(Cmd::MoveTo);
+    app_frame(&mut app, &ctx);
+    app_input(&mut app, &ctx, vec![press(egui::Key::Escape)]);
+    assert!(dest_picker(&app).is_none());
+    for _ in 0..5 {
+        app_frame(&mut app, &ctx);
+    }
+    assert!(d.join("b.txt").exists() && !d.join("box/b.txt").exists(), "cancelled");
+    purge_trashed_under(&d);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// What the picker refuses, each with its reason, and the picker stays open to choose
+/// again: a folder into itself or below it, the trash, inside an archive, a folder that
+/// isn't there, a move to where things already are. A link to a folder may go into
+/// the folder it points at; a copy beside the original is a duplicate.
+#[test]
+fn copy_to_refuses_what_makes_no_sense() {
+    use crate::copyto::refusal;
+    let d = tmpdir("copytoref");
+    touch(&d.join("box/inner/x.txt"), "x");
+    touch(&d.join("f.txt"), "f");
+    touch(&d.join("bundle.zip"), "PK");
+    std::os::unix::fs::symlink(d.join("box"), d.join("box-link")).unwrap();
+    let boxed = vec![d.join("box")];
+    assert_eq!(refusal(&boxed, &d.join("box"), false).as_deref(), Some("A folder can't go inside itself"));
+    assert_eq!(refusal(&boxed, &d.join("box/inner"), true).as_deref(), Some("A folder can't go inside itself"));
+    assert_eq!(refusal(&boxed, &d.join("box-link/inner"), false).as_deref(), Some("A folder can't go inside itself"), "through a link too");
+    assert_eq!(refusal(&[d.join("box-link")], &d.join("box"), true), None, "the link moves, not the folder");
+    assert!(refusal(&boxed, &d.join("bundle.zip/docs"), false).is_some_and(|w| w.starts_with("Archives are read-only")));
+    assert!(refusal(&boxed, &d.join("nowhere"), false).is_some_and(|w| w.starts_with("No folder at ")));
+    assert!(refusal(&boxed, &d.join("f.txt"), false).is_some_and(|w| w.starts_with("No folder at ")), "a file is no folder");
+    let trash = crate::sidebar::trash_dir();
+    assert!(refusal(&[d.join("f.txt")], &trash, true).is_some_and(|w| w.contains("Move To Trash")));
+    assert!(refusal(&[d.join("f.txt")], trash.parent().unwrap(), false).is_some());
+    assert!(crate::copyto::in_trash(Path::new("/run/media/stick/.Trash-1000/files")));
+    assert!(!crate::copyto::in_trash(&d));
+    assert!(refusal(&[d.join("f.txt")], Path::new(&format!("{}:computer", "maia")), false).is_some());
+    assert_eq!(refusal(&[d.join("f.txt")], &d, true).as_deref(), Some("Already in that folder"));
+    assert_eq!(refusal(&[d.join("f.txt"), d.join("box/inner/x.txt")], &d, true), None, "one of them still has to move");
+    assert_eq!(refusal(&[d.join("f.txt")], &d, false), None, "a copy beside it is a duplicate");
+    assert_eq!(refusal(&[d.join("f.txt")], &d.join("box"), false), None);
+    // In the picker: refused, said, still open, nothing copied.
+    let ctx = egui::Context::default();
+    let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+    pick_entry(&mut app, &ctx, "box");
+    app.run(Cmd::CopyTo);
+    app_frame(&mut app, &ctx);
+    app_input(&mut app, &ctx, vec![egui::Event::Text(format!("{}/box/inner/", d.display()))]);
+    app_until(&mut app, &ctx, "the folder read", |a| dest_picker(a).is_some_and(|st| st.items.first().is_some_and(|i| i.path == d.join("box/inner"))));
+    app_input(&mut app, &ctx, vec![press(egui::Key::Enter)]);
+    let st = dest_picker(&app).expect("the picker stays to choose again");
+    assert_eq!(st.dest.as_ref().unwrap().refused.as_deref(), Some("A folder can't go inside itself"));
+    // Typing again takes the reason away.
+    app_input(&mut app, &ctx, vec![press(egui::Key::Backspace)]);
+    app_frame(&mut app, &ctx);
+    assert_eq!(dest_picker(&app).unwrap().dest.as_ref().unwrap().refused, None);
+    app_input(&mut app, &ctx, vec![press(egui::Key::Escape)]);
+    assert!(!d.join("box/inner/box").exists());
+    // Nothing to move inside an archive, and nothing picked without a selection.
+    app.tab().selected.clear();
+    app.tab().cursor = None;
+    app.run(Cmd::CopyTo);
+    assert!(dest_picker(&app).is_none() && app.toast.as_ref().is_some_and(|t| t.0 == "Select what to copy"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The remembered destinations: newest first, each once, at most `KEEP`; written with
+/// the user data and read back (an older file without them reads as none).
+#[test]
+fn copy_to_remembers_a_few_destinations() {
+    let mut ud = crate::config::UserData::default();
+    for i in 0..12 {
+        crate::copyto::remember(&mut ud, Path::new(&format!("/d/{i}")));
+    }
+    crate::copyto::remember(&mut ud, Path::new("/d/5"));
+    assert_eq!(ud.destinations.len(), crate::copyto::KEEP);
+    assert_eq!(ud.destinations[0], PathBuf::from("/d/5"));
+    assert_eq!(ud.destinations[1], PathBuf::from("/d/11"));
+    assert_eq!(ud.destinations.iter().filter(|p| **p == Path::new("/d/5")).count(), 1);
+    let json = serde_json::to_string(&ud).unwrap();
+    let back: crate::config::UserData = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.destinations, ud.destinations);
+    let old: crate::config::UserData = serde_json::from_str(r#"{"bookmarks":["/x"]}"#).unwrap();
+    assert!(old.destinations.is_empty());
+    // Their default keys, beside F5 and F6.
+    let km = Keymap::build(&Default::default());
+    assert_eq!(km.lookup(&commands::parse_binding("Shift+F5").unwrap()).0, Some(Cmd::CopyTo));
+    assert_eq!(km.lookup(&commands::parse_binding("Shift+F6").unwrap()).0, Some(Cmd::MoveTo));
+}
+
+/// Select Matching… on a real folder: globs with `*`, `?`, classes and `{a,b}`, case
+/// ignored, added to what is selected; only what the view shows (hidden files and the
+/// filter respected); paths below the folder in a flattened listing.
+#[test]
+fn select_matching_adds_what_the_pattern_names() {
+    use crate::selmatch::{Pattern, select};
+    let d = tmpdir("selmatch");
+    for f in ["IMG_0001.JPG", "img_0002.jpg", "IMG_0003.png", "holiday.jpeg", "notes.txt", "a.b.tar.gz", ".hidden.jpg", "raw/IMG_0004.jpg", "src/main.rs", "src/deep/lib.rs"] {
+        touch(&d.join(f), "x");
+    }
+    let stats = HashMap::new();
+    let mut t = Tab::new(1, d.clone(), ViewSettings::default(), egui::Context::default());
+    pump(&mut t, &stats);
+    let selected = |t: &Tab| {
+        let mut v: Vec<String> = t.selected.iter().map(|&i| t.entries[i as usize].name.clone()).collect();
+        v.sort();
+        v
+    };
+    let pat = |s: &str| Pattern::new(s).unwrap();
+    assert_eq!(select(&mut t, &pat("*.jpg")), 2);
+    assert_eq!(selected(&t), ["IMG_0001.JPG", "img_0002.jpg"], "case ignored, the hidden one not shown so not chosen");
+    assert!(t.cursor.is_some_and(|c| t.selected.contains(&c)), "the cursor on a match");
+    // Added to, not replaced.
+    assert_eq!(select(&mut t, &pat("*.{png,jpeg}")), 2);
+    assert_eq!(selected(&t), ["IMG_0001.JPG", "IMG_0003.png", "holiday.jpeg", "img_0002.jpg"]);
+    t.selected.clear();
+    assert_eq!(select(&mut t, &pat("img_000[13].*")), 2);
+    assert_eq!(selected(&t), ["IMG_0001.JPG", "IMG_0003.png"]);
+    t.selected.clear();
+    assert_eq!(select(&mut t, &pat("  ?????.txt ")), 1, "spaces around are trimmed");
+    assert_eq!(select(&mut t, &pat("*.tar.gz")), 1);
+    assert_eq!(select(&mut t, &pat("raw")), 1, "a folder matches by its name");
+    assert_eq!(select(&mut t, &pat("{a,b}")), 0, "a whole name or nothing");
+    assert_eq!(select(&mut t, &pat("{notes}.txt")), 0, "a brace with no comma is a character");
+    assert!(Pattern::new("   ").is_none());
+    // The filter narrows what can be chosen.
+    t.selected.clear();
+    t.filter = "IMG".into();
+    pump(&mut t, &stats);
+    assert_eq!(select(&mut t, &pat("*")), 3);
+    assert_eq!(selected(&t), ["IMG_0001.JPG", "IMG_0003.png", "img_0002.jpg"]);
+    // Flattened: names anywhere below, or a path below the folder.
+    t.filter.clear();
+    t.selected.clear();
+    t.set_flatten(true);
+    pump(&mut t, &stats);
+    assert_eq!(select(&mut t, &pat("img_*.jpg")), 3, "raw/IMG_0004.jpg too");
+    t.selected.clear();
+    assert_eq!(select(&mut t, &pat("src/*.rs")), 2, "`*` crosses folders as the picker's globs do");
+    assert_eq!(selected(&t), ["lib.rs", "main.rs"]);
+    t.selected.clear();
+    assert_eq!(select(&mut t, &pat("src/main.rs")), 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Through the prompt: what it says, and the selection of the active tab.
+#[test]
+fn select_matching_prompt_says_how_many() {
+    let ctx = egui::Context::default();
+    let d = tmpdir("selprompt");
+    for f in ["a.jpg", "b.JPG", "c.png"] {
+        touch(&d.join(f), "x");
+    }
+    let mut app = crate::app::App::new(&ctx, vec![d.clone()]);
+    pick_entry(&mut app, &ctx, "c.png");
+    app.run(Cmd::SelectMatching);
+    assert!(matches!(app.popup, crate::popups::Popup::Prompt { .. }));
+    app_frame(&mut app, &ctx);
+    app_input(&mut app, &ctx, vec![egui::Event::Text("*.jpg".into())]);
+    app_input(&mut app, &ctx, vec![press(egui::Key::Enter)]);
+    assert!(matches!(app.popup, crate::popups::Popup::None));
+    assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("2 items match *.jpg"));
+    let names: HashSet<String> = app.tab().target_entries().iter().map(|e| e.name.clone()).collect();
+    assert_eq!(names, ["a.jpg", "b.JPG", "c.png"].map(String::from).into(), "added to the one selected");
+    crate::selmatch::run(&mut app, "*.gif");
+    assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Nothing here matches *.gif"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Run one archive change on this thread, as its job would: Ok, or the error it ends with.
+fn archive_edit(a: &Path, e: crate::archwrite::Edit) -> Result<(), String> {
+    let (cancel, pause) = (std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false));
+    let p = std::sync::Mutex::new(ops::Progress::default());
+    let r = crate::archwrite::edit(a, &e, &p, &ops::Gate::new(&cancel, &pause), &egui::Context::default());
+    if r.is_ok() {
+        let g = p.lock().unwrap();
+        assert!(g.total_bytes > 0 && g.done_bytes == g.total_bytes, "{}: {} of {} bytes counted", a.display(), g.done_bytes, g.total_bytes);
+    }
+    r
+}
+
+/// An archive's names and, for files, contents, as the real bsdtar (or 7z, for a locked
+/// one) gives them back.
+fn archive_contents(a: &Path) -> std::collections::BTreeMap<String, String> {
+    let all = crate::archive::list(a).unwrap_or_else(|e| panic!("{}: {e}", a.display()));
+    let x = a.with_file_name(format!("x-{}", a.file_name().unwrap().to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&x);
+    crate::archive::extract(a, &[], &x).unwrap_or_else(|e| panic!("{}: {e}", a.display()));
+    let m = all.iter().map(|i| (i.path.display().to_string(), if i.is_dir { "/".to_string() } else { std::fs::read_to_string(x.join(&i.path)).unwrap_or_else(|e| format!("unreadable: {e}")) })).collect();
+    let _ = std::fs::remove_dir_all(&x);
+    m
+}
+
+/// The versions of `a` an edit sent to the trash, gone from it again.
+fn purge_trashed(a: &Path) {
+    for it in crate::trashcan::list().into_iter().filter(|it| it.original == a) {
+        let _ = crate::trashcan::purge(&it);
+    }
+}
+
+/// Files added, members deleted and renamed, new folders: in zips (one written by bsdtar,
+/// with data descriptors 7z can't rename in place, and one by 7z), 7z and every tarball
+/// kind, each made by the real tools; with the 7z command and, on a thread that can't
+/// see it, without (every change a rebuild). Each change leaves the old archive in the
+/// trash, where Undo's swap finds it, and nothing of its work beside the archive.
+#[test]
+fn archives_change_in_place() {
+    use crate::archwrite::Edit;
+    if !crate::archive::available() {
+        return;
+    }
+    let d = tmpdir("archedit");
+    let src = d.join("src");
+    touch(&src.join("notes.txt"), "the notes");
+    touch(&src.join("docs/a.txt"), "first doc");
+    touch(&src.join("Trip – é/b.txt"), "sand");
+    let add = d.join("add");
+    touch(&add.join("new.txt"), "brand new");
+    touch(&add.join("more/c.txt"), "more inside");
+    touch(&add.join("notes.txt"), "other notes");
+    let have7 = crate::archive::seven().is_ok();
+    let mut kinds = vec!["zip", "7z", "tar", "tar.gz", "tgz", "tar.xz", "tar.zst", "tar.bz2", "cbz"];
+    if have7 {
+        kinds.push("7zip.zip");
+    }
+    for without7 in [false, true] {
+        if without7 && !have7 {
+            continue;
+        }
+        crate::archive::NO_SEVEN.with(|n| n.set(without7));
+        for ext in &kinds {
+            let a = d.join(format!("pack-{without7}.{ext}"));
+            let names = ["notes.txt", "docs", "Trip – é"];
+            let made = if *ext == "7zip.zip" {
+                std::process::Command::new("7z").env("LC_ALL", "C.UTF-8").args(["a", "-bso0", "-bsp0", "-tzip"]).arg(&a).args(names).current_dir(&src).status().is_ok_and(|s| s.success())
+            } else {
+                let fmt = match *ext {
+                    "zip" | "cbz" => "zip",
+                    "7z" => "7zip",
+                    _ => "pax",
+                };
+                let filter: &[&str] = match *ext {
+                    "tar.gz" | "tgz" => &["-z"],
+                    "tar.xz" => &["-J"],
+                    "tar.zst" => &["--zstd"],
+                    "tar.bz2" => &["-j"],
+                    _ => &[],
+                };
+                std::process::Command::new("bsdtar").env("LC_ALL", "C.UTF-8").arg("-cf").arg(&a).args(["--format", fmt]).args(filter).arg("-C").arg(&src).args(names).status().is_ok_and(|s| s.success())
+            };
+            assert!(made, "{ext}: made by the real tool");
+            let before = archive_contents(&a);
+            // When each change was made, as its Undo entry keeps it.
+            let made = std::cell::RefCell::new(vec![]);
+            let step = |what: &str, e: Edit| {
+                archive_edit(&a, e).unwrap_or_else(|e| panic!("{ext} ({}): {what}: {e}", if without7 { "no 7z" } else { "7z" }));
+                made.borrow_mut().push(std::time::SystemTime::now());
+                assert!(crate::picfix::newest_trashed(&a).is_some(), "{ext}: {what}: the old one in the trash");
+                let left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with('.')).collect();
+                assert!(left.is_empty(), "{ext}: {what}: left beside it: {left:?}");
+                archive_contents(&a)
+            };
+            // Added into a folder inside, a folder with it; a name taken kept beside.
+            let c = step("add", Edit::Add { srcs: vec![add.join("new.txt"), add.join("more"), add.join("notes.txt")], into: PathBuf::from("docs"), replace: false });
+            assert_eq!(c.get("docs/new.txt").map(String::as_str), Some("brand new"), "{ext}: {c:?}");
+            assert_eq!(c.get("docs/more/c.txt").map(String::as_str), Some("more inside"), "{ext}");
+            assert_eq!(c.get("docs/notes.txt").map(String::as_str), Some("other notes"), "{ext}: not taken there");
+            let after_add = c.clone();
+            let c = step("add, keep both", Edit::Add { srcs: vec![add.join("notes.txt")], into: PathBuf::new(), replace: false });
+            assert_eq!((c.get("notes.txt").map(String::as_str), c.get("notes (1).txt").map(String::as_str)), (Some("the notes"), Some("other notes")), "{ext}");
+            let c = step("add, replace", Edit::Add { srcs: vec![add.join("notes.txt")], into: PathBuf::new(), replace: true });
+            assert_eq!(c.get("notes.txt").map(String::as_str), Some("other notes"), "{ext}: replaced");
+            // Deleted: a file, and a folder with what is in it.
+            let c = step("delete", Edit::Delete { members: vec![PathBuf::from("docs/a.txt"), PathBuf::from("Trip – é")] });
+            assert!(!c.contains_key("docs/a.txt") && !c.keys().any(|k| k.starts_with("Trip")), "{ext}: {c:?}");
+            assert_eq!(c.get("docs/new.txt").map(String::as_str), Some("brand new"), "{ext}: the rest stays");
+            // Renamed: a file, and a folder, which takes what is in it along.
+            let c = step("rename", Edit::Rename { pairs: vec![(PathBuf::from("notes (1).txt"), "kept.txt".into()), (PathBuf::from("docs"), "papers".into())] });
+            assert_eq!(c.get("kept.txt").map(String::as_str), Some("other notes"), "{ext}: {c:?}");
+            assert_eq!(c.get("papers/more/c.txt").map(String::as_str), Some("more inside"), "{ext}: {c:?}");
+            assert!(!c.keys().any(|k| k.starts_with("docs")), "{ext}: {c:?}");
+            // A new folder and a new file.
+            step("new folder", Edit::Make { at: PathBuf::from("papers/New folder"), folder: true });
+            let c = step("new file", Edit::Make { at: PathBuf::from("papers/New folder/empty.txt"), folder: false });
+            assert_eq!(c.get("papers/New folder").map(String::as_str), Some("/"), "{ext}: {c:?}");
+            assert_eq!(c.get("papers/New folder/empty.txt").map(String::as_str), Some(""), "{ext}");
+            // Refused before anything is done: a name taken, a member that isn't there.
+            assert!(archive_edit(&a, Edit::Rename { pairs: vec![(PathBuf::from("kept.txt"), "notes.txt".into())] }).is_err_and(|e| e.contains("already")), "{ext}");
+            assert!(archive_edit(&a, Edit::Delete { members: vec![PathBuf::from("nope.txt")] }).is_err(), "{ext}");
+            // Undo, change by change, is the archive as it was made; Redo of the first
+            // change is the archive after it.
+            let mut undone = vec![];
+            for t in made.borrow().iter().rev() {
+                assert_eq!(crate::picfix::undo_replaced_by(&[a.clone()], Some(*t)), 0, "{ext}: undone");
+                undone.push(std::time::SystemTime::now());
+            }
+            assert_eq!(archive_contents(&a), before, "{ext}: undone back to the start");
+            assert_eq!(crate::picfix::undo_replaced_by(&[a.clone()], undone.last().copied()), 0, "{ext}: redone");
+            assert_eq!(archive_contents(&a), after_add, "{ext}: the first change again");
+            purge_trashed(&a);
+        }
+    }
+    crate::archive::NO_SEVEN.with(|n| n.set(false));
+    // What can only be read says so.
+    for (n, why) in [("x.rar", "RAR archives can only be read here"), ("x.iso", "ISO archives"), ("x.deb", "DEB archives"), ("notes.txt.gz", "one compressed file"), ("x.tar.lz", "LZ archives")] {
+        assert!(crate::archwrite::kind(Path::new(n)).is_err_and(|e| e.contains(why)), "{n}");
+    }
+    assert!(crate::archwrite::kind(Path::new("x.tar.zst")).is_ok() && crate::archwrite::kind(Path::new("X.ZIP")).is_ok());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Locked archives changed in place, made by the real tools (Info-ZIP's ZipCrypto, 7z's
+/// AES zip, 7z with and without its names locked): asked for the password, a wrong one
+/// refused with the archive untouched, and with the right one what is added is locked
+/// the same way, as the real 7z reports it; names locked stay locked. Without the 7z
+/// command the zips are rebuilt, locked again by bsdtar the way they were.
+#[test]
+fn locked_archives_change_and_stay_locked() {
+    use crate::archive::{NEEDS_PASSWORD, WRONG_PASSWORD, forget_password, set_password};
+    use crate::archwrite::Edit;
+    if !crate::archive::available() {
+        return;
+    }
+    let d = tmpdir("lockedit");
+    let src = d.join("src");
+    touch(&src.join("notes.txt"), "the secret plan");
+    touch(&src.join("Trip photos/beach.txt"), "sand");
+    touch(&d.join("add/late.txt"), "added later");
+    let Some(made) = encrypted_archives(&d, &src, "hunter2") else {
+        eprintln!("zip or 7z missing: skipped");
+        return;
+    };
+    let slt = |a: &Path| String::from_utf8_lossy(&std::process::Command::new("7z").args(["l", "-slt", "-ba", "-phunter2"]).arg(a).output().unwrap().stdout).into_owned();
+    let block = |t: &str, path: &str| t.split("\n\n").find(|b| b.lines().any(|l| l == format!("Path = {path}"))).unwrap_or("").to_string();
+    for without7 in [false, true] {
+        crate::archive::NO_SEVEN.with(|n| n.set(without7));
+        for m in &made {
+            let a = d.join(format!("{without7}-{}", m.file_name().unwrap().to_string_lossy()));
+            std::fs::copy(m, &a).unwrap();
+            let name = a.file_name().unwrap().to_string_lossy().into_owned();
+            let add = Edit::Add { srcs: vec![d.join("add/late.txt")], into: PathBuf::new(), replace: false };
+            if without7 && name.ends_with(".7z") {
+                set_password(&a, "hunter2".into());
+                let r = archive_edit(&a, add);
+                assert!(r.as_ref().is_err_and(|e| e.contains("7z command")), "{name}: {r:?}");
+                continue;
+            }
+            let bytes = std::fs::read(&a).unwrap();
+            forget_password(&a);
+            assert_eq!(archive_edit(&a, add.clone()).err().as_deref(), Some(NEEDS_PASSWORD), "{name}");
+            set_password(&a, "wrong".into());
+            assert_eq!(archive_edit(&a, add.clone()).err().as_deref(), Some(WRONG_PASSWORD), "{name}");
+            assert!(std::fs::read(&a).unwrap() == bytes && crate::picfix::newest_trashed(&a).is_none(), "{name}: untouched");
+            set_password(&a, "hunter2".into());
+            archive_edit(&a, add).unwrap_or_else(|e| panic!("{name}: {e}"));
+            archive_edit(&a, Edit::Rename { pairs: vec![(PathBuf::from("Trip photos"), "Holiday".into())] }).unwrap_or_else(|e| panic!("{name}: {e}"));
+            archive_edit(&a, Edit::Delete { members: vec![PathBuf::from("notes.txt")] }).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let c = archive_contents(&a);
+            assert_eq!(c.get("late.txt").map(String::as_str), Some("added later"), "{name}: {c:?}");
+            assert_eq!(c.get("Holiday/beach.txt").map(String::as_str), Some("sand"), "{name}: {c:?}");
+            assert!(!c.contains_key("notes.txt"), "{name}");
+            // Locked as it was: what was added too.
+            let t = slt(&a);
+            for f in ["late.txt", "Holiday/beach.txt"] {
+                let b = block(&t, f);
+                assert!(b.contains("Encrypted = +"), "{name}: {f} locked: {b}");
+                if name.ends_with("aes.zip") {
+                    assert!(b.contains("AES-256"), "{name}: {b}");
+                }
+                if name.ends_with("crypto.zip") {
+                    assert!(b.contains("ZipCrypto"), "{name}: {b}");
+                }
+            }
+            if name.contains("hidden") {
+                let o = std::process::Command::new("7z").args(["l", "-ba", "-pnot-it"]).arg(&a).output().unwrap();
+                assert!(!o.status.success(), "{name}: names still locked");
+            }
+            purge_trashed(&a);
+            let _ = std::fs::remove_dir_all(crate::archive::open_cache(&a));
+        }
+    }
+    crate::archive::NO_SEVEN.with(|n| n.set(false));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Compressing as a job, through the real bsdtar and 7z: every format at each level
+/// (the smallest smaller than the fastest, on text that compresses), sources from two
+/// folders in one archive, a locked one; and a long one watched as it goes: its bytes
+/// count up between the ends, Pause holds them still (the tool is stopped), and Cancel
+/// ends it with nothing left behind, not even an error.
+#[test]
+fn compress_jobs_report_progress_and_cancel() {
+    use crate::archwrite::Level;
+    use std::sync::atomic::Ordering;
+    if !crate::archive::available() {
+        return;
+    }
+    let ctx = egui::Context::default();
+    let d = tmpdir("compressjob");
+    // Text as text goes: words picked at random from a small vocabulary.
+    let vocab = ["the", "archive", "keeps", "every", "file", "under", "one", "name", "and", "a", "smaller", "size", "when", "its", "words", "repeat", "often", "enough"];
+    let mut x = 0x2545_F491u64;
+    let words: String = (0..400_000)
+        .map(|i| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            format!("{}{}", vocab[(x >> 33) as usize % vocab.len()], if i % 13 == 12 { "\n" } else { " " })
+        })
+        .collect();
+    touch(&d.join("a/log.txt"), &words);
+    touch(&d.join("b/deep/other.txt"), "from another folder");
+    let run = |srcs: Vec<PathBuf>, out: &Path, level: Level, pw: Option<&str>| {
+        let j = ops::spawn(1, OpKind::Compress { srcs, out: out.to_path_buf(), password: pw.map(|p| crate::archive::Secret(p.into())), level }, ctx.clone());
+        let start = Instant::now();
+        while !j.progress.lock().unwrap().finished {
+            assert!(start.elapsed() < Duration::from_secs(60), "compress timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let p = j.progress.lock().unwrap();
+        assert!(p.errors.is_empty(), "{}: {:?}", out.display(), p.errors);
+        assert!(p.total_bytes > 0 && p.done_bytes == p.total_bytes, "{}: {} of {}", out.display(), p.done_bytes, p.total_bytes);
+    };
+    for ext in ["zip", "tar.gz", "tar.xz", "7z"] {
+        let (fast, small) = (d.join(format!("fast.{ext}")), d.join(format!("small.{ext}")));
+        run(vec![d.join("a/log.txt")], &fast, Level::Fast, None);
+        run(vec![d.join("a/log.txt")], &small, Level::Smallest, None);
+        let (f, s) = (std::fs::metadata(&fast).unwrap().len(), std::fs::metadata(&small).unwrap().len());
+        assert!(s < f, "{ext}: smallest {s} not below fast {f}");
+        assert_eq!(archive_contents(&small).get("log.txt").map(String::as_str), Some(words.as_str()), "{ext}");
+        // Two folders, one archive: each item at its top.
+        let two = d.join(format!("two.{ext}"));
+        run(vec![d.join("a/log.txt"), d.join("b/deep")], &two, Level::Normal, None);
+        let c = archive_contents(&two);
+        assert_eq!(c.get("deep/other.txt").map(String::as_str), Some("from another folder"), "{ext}: {:?}", c.keys().collect::<Vec<_>>());
+        assert!(c.contains_key("log.txt"), "{ext}");
+    }
+    // Locked, from two folders: a 7z gathers them for the 7z command.
+    if crate::archive::can_lock_7z() {
+        let l = d.join("locked.7z");
+        run(vec![d.join("a/log.txt"), d.join("b/deep")], &l, Level::Fast, Some("pa ss"));
+        crate::archive::forget_password(&l);
+        assert_eq!(crate::archive::list(&l).err().as_deref(), Some(crate::archive::NEEDS_PASSWORD));
+        crate::archive::set_password(&l, "pa ss".into());
+        assert_eq!(archive_contents(&l).get("deep/other.txt").map(String::as_str), Some("from another folder"));
+    }
+    assert!(std::fs::read_dir(&d).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with('.')), "no part or gathering folder left");
+    // A long one: 48 MB that won't compress, at xz's smallest.
+    let mut noise = vec![0u8; 48 << 20];
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for b in noise.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    std::fs::write(d.join("noise.bin"), &noise).unwrap();
+    let out = d.join("noise.tar.xz");
+    let j = ops::spawn(2, OpKind::Compress { srcs: vec![d.join("noise.bin")], out: out.clone(), password: None, level: Level::Smallest }, ctx.clone());
+    let done = || j.progress.lock().unwrap().done_bytes;
+    let start = Instant::now();
+    while done() < 4 << 20 {
+        assert!(start.elapsed() < Duration::from_secs(60) && !j.progress.lock().unwrap().finished, "no progress seen");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let total = j.progress.lock().unwrap().total_bytes;
+    assert_eq!(total, 48 << 20);
+    j.pause.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    let held = done();
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(done(), held, "paused: the tool is stopped");
+    assert!(held > 0 && held < total, "between the ends: {held} of {total}");
+    j.pause.store(false, Ordering::Relaxed);
+    let start = Instant::now();
+    while done() <= held {
+        assert!(start.elapsed() < Duration::from_secs(30), "resumed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    j.cancel.store(true, Ordering::Relaxed);
+    wait_job(&j);
+    assert!(j.progress.lock().unwrap().errors.is_empty(), "a cancel is not an error");
+    assert!(!out.exists(), "nothing made");
+    assert!(std::fs::read_dir(&d).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with('.')), "no part file left");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A lone compressed file (gzip, bzip2, xz, zstd, each written by bsdtar's raw format) is
+/// an archive of the one file its name says, sized and read whole; a .deb (an ar
+/// archive, as bsdtar writes one) and an .rpm (an empty signature and header over a cpio
+/// payload, the layout libarchive reads) list and extract as archives. Extract Here on
+/// the .gz gives the file, through the job.
+#[test]
+fn lone_compressed_files_and_packages_open_as_archives() {
+    use crate::archive::{entries, extract, extract_for_open, is_archive, read_member, single, stem};
+    if !crate::archive::available() {
+        return;
+    }
+    let d = tmpdir("lonepack");
+    let text: String = (0..5000).map(|i| format!("{i} – é\n")).collect();
+    touch(&d.join("src/server.log"), &text);
+    let bsdtar = |args: &[&str]| assert!(std::process::Command::new("bsdtar").env("LC_ALL", "C.UTF-8").args(args).current_dir(&d).status().unwrap().success(), "{args:?}");
+    for (ext, filter) in [("gz", "-z"), ("bz2", "-j"), ("xz", "-J"), ("zst", "--zstd")] {
+        let a = d.join(format!("server.log.{ext}"));
+        bsdtar(&["-cf", a.to_str().unwrap(), "--format", "raw", filter, "-C", "src", "server.log"]);
+        assert!(is_archive(&format!("server.log.{ext}")) && single(&a) && stem(&format!("server.log.{ext}")) == "server.log", "{ext}");
+        let e = entries(&a, Path::new("")).unwrap_or_else(|e| panic!("{ext}: {e}"));
+        assert_eq!(e.len(), 1, "{ext}");
+        assert_eq!((e[0].name.as_str(), e[0].size, e[0].is_dir), ("server.log", text.len() as u64, false), "{ext}");
+        assert_eq!(e[0].path, a.join("server.log"));
+        assert_eq!(read_member(&a, Path::new("server.log"), 1 << 20).unwrap(), text.as_bytes(), "{ext}");
+        let f = extract_for_open(&a, Path::new("server.log")).unwrap_or_else(|e| panic!("{ext}: {e}"));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), text, "{ext}");
+        let x = d.join(format!("x-{ext}"));
+        extract(&a, &[], &x).unwrap();
+        assert_eq!(std::fs::read_to_string(x.join("server.log")).unwrap(), text, "{ext}");
+        let _ = std::fs::remove_dir_all(crate::archive::open_cache(&a));
+    }
+    // Not a tarball's: those stay tarballs.
+    assert!(!single(Path::new("x.tar.gz")) && !single(Path::new("x.tar.zst")) && single(Path::new("x.json.zst")));
+    // Extract Here on one: the file beside it, counted against the archive's size.
+    let ctx = egui::Context::default();
+    let out = d.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let j = ops::spawn(1, OpKind::Extract { archive: d.join("server.log.xz"), members: vec![], dest: out.clone() }, ctx.clone());
+    wait_job(&j);
+    assert!(j.progress.lock().unwrap().errors.is_empty(), "{:?}", j.progress.lock().unwrap().errors);
+    assert_eq!(std::fs::read_to_string(out.join("server.log")).unwrap(), text);
+    assert!(j.progress.lock().unwrap().done_bytes == std::fs::metadata(d.join("server.log.xz")).unwrap().len());
+    // A .deb: debian-binary, control and data, as dpkg lays them out.
+    touch(&d.join("pkg/data/usr/share/doc/hello/README"), "hello from the package");
+    touch(&d.join("pkg/control/control"), "Package: hello\nVersion: 1.0\n");
+    touch(&d.join("pkg/deb/debian-binary"), "2.0\n");
+    bsdtar(&["-czf", "pkg/deb/control.tar.gz", "-C", "pkg/control", "control"]);
+    bsdtar(&["-cJf", "pkg/deb/data.tar.xz", "-C", "pkg/data", "usr"]);
+    bsdtar(&["-cf", "hello_1.0_all.deb", "--format", "ar", "-C", "pkg/deb", "debian-binary", "control.tar.gz", "data.tar.xz"]);
+    let deb = d.join("hello_1.0_all.deb");
+    assert!(is_archive("hello_1.0_all.deb"));
+    let mut names: Vec<String> = entries(&deb, Path::new("")).unwrap().iter().map(|e| e.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["control.tar.gz", "data.tar.xz", "debian-binary"]);
+    let f = extract_for_open(&deb, Path::new("debian-binary")).unwrap();
+    assert_eq!(std::fs::read_to_string(f).unwrap(), "2.0\n");
+    // An .rpm: the lead, two empty headers, a gzipped cpio of the files.
+    bsdtar(&["-czf", "payload.cpio.gz", "--format", "newc", "-C", "pkg/data", "./usr"]);
+    let mut rpm = vec![0xed, 0xab, 0xee, 0xdb, 3, 0, 0, 0, 0, 1];
+    rpm.extend(b"hello-1.0-1".iter().copied().chain(std::iter::repeat(0)).take(66));
+    rpm.extend([0, 1, 0, 5]);
+    rpm.extend([0u8; 16]);
+    for _ in 0..2 {
+        rpm.extend([0x8e, 0xad, 0xe8, 0x01, 0, 0, 0, 0]);
+        rpm.extend([0u8; 8]);
+    }
+    rpm.extend(std::fs::read(d.join("payload.cpio.gz")).unwrap());
+    let r = d.join("hello-1.0-1.noarch.rpm");
+    std::fs::write(&r, rpm).unwrap();
+    assert!(is_archive("hello-1.0-1.noarch.rpm"));
+    let doc = entries(&r, Path::new("usr/share/doc/hello")).unwrap_or_else(|e| panic!("rpm: {e}"));
+    assert_eq!(doc.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["README"]);
+    let x = d.join("x-rpm");
+    extract(&r, &[PathBuf::from("usr/share/doc/hello/README")], &x).unwrap();
+    assert_eq!(std::fs::read_to_string(x.join("usr/share/doc/hello/README")).unwrap(), "hello from the package");
+    for c in [&deb, &r] {
+        let _ = std::fs::remove_dir_all(crate::archive::open_cache(c));
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An archive change cancelled halfway (a big tarball being rebuilt) leaves the archive
+/// as it was and nothing beside it; refused kinds and a missing member change nothing.
+#[test]
+fn archive_change_cancelled_leaves_it_alone() {
+    use crate::archwrite::Edit;
+    use std::sync::atomic::Ordering;
+    if !crate::archive::available() {
+        return;
+    }
+    let d = tmpdir("editcancel");
+    let mut noise = vec![0u8; 40 << 20];
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for b in noise.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(d.join("src/noise.bin"), &noise).unwrap();
+    touch(&d.join("src/small.txt"), "small");
+    let a = d.join("big.tar.xz");
+    assert!(std::process::Command::new("bsdtar").args(["-cJf"]).arg(&a).arg("-C").arg(d.join("src")).args(["noise.bin", "small.txt"]).status().unwrap().success());
+    let bytes = std::fs::read(&a).unwrap();
+    let j = ops::spawn(1, OpKind::ArchiveEdit { archive: a.clone(), edit: Edit::Delete { members: vec![PathBuf::from("small.txt")] } }, egui::Context::default());
+    let start = Instant::now();
+    // Into the packing, past the extraction.
+    while j.progress.lock().unwrap().done_bytes <= bytes.len() as u64 + (4 << 20) {
+        assert!(start.elapsed() < Duration::from_secs(60) && !j.progress.lock().unwrap().finished, "no progress");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    j.cancel.store(true, Ordering::Relaxed);
+    wait_job(&j);
+    let p = j.progress.lock().unwrap();
+    assert!(p.errors.is_empty() && p.replaced.is_empty(), "{:?}", p.errors);
+    assert!(std::fs::read(&a).unwrap() == bytes, "untouched");
+    assert!(crate::picfix::newest_trashed(&a).is_none(), "nothing trashed");
+    let left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with('.')).collect();
+    assert!(left.is_empty(), "left beside it: {left:?}");
+    drop(p);
+    // A rar is only read; a member not there is not deleted.
+    let rar = d.join("x.rar");
+    std::fs::write(&rar, b"Rar!").unwrap();
+    assert!(archive_edit(&rar, Edit::Delete { members: vec![PathBuf::from("a")] }).is_err_and(|e| e.contains("can only be read")));
+    assert!(archive_edit(&a, Edit::Delete { members: vec![PathBuf::from("gone.txt")] }).is_err_and(|e| e.contains("isn't in it")));
+    assert!(std::fs::read(&a).unwrap() == bytes);
     let _ = std::fs::remove_dir_all(&d);
 }
 

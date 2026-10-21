@@ -1120,6 +1120,8 @@ pub struct View {
     jump: Option<f32>,
     /// Where the document's top left was drawn last.
     origin: Pos2,
+    /// Text selected: (text piece, counted in reading order; character in it).
+    pub sel: Option<crate::textsel::Sel>,
 }
 
 /// The document's formulas, typeset on a thread the first time it is shown.
@@ -1213,7 +1215,47 @@ impl View {
     }
 
     pub fn new(doc: Doc) -> View {
-        View { doc, laid: None, math: Maths::default(), jump: None, origin: Pos2::ZERO }
+        View { doc, laid: None, math: Maths::default(), jump: None, origin: Pos2::ZERO, sel: None }
+    }
+
+    /// The text selected, as plain text: pieces side by side (table cells) apart by a
+    /// tab, a list's number and its item by a space, the rest by line breaks.
+    pub fn copy_text(&self) -> String {
+        let (Some(sel), Some(l)) = (self.sel.filter(|s| !s.is_empty()), &self.laid) else { return String::new() };
+        let ((k0, c0), (k1, c1)) = sel.span();
+        let mut out = String::new();
+        let mut prev: Option<(f32, &str)> = None;
+        for (k, (pos, g)) in texts(&l.pieces).enumerate().skip(k0) {
+            if k > k1 {
+                break;
+            }
+            let t = g.text();
+            let n = t.chars().count();
+            let (a, b) = (if k == k0 { c0.min(n) } else { 0 }, if k == k1 { c1.min(n) } else { n });
+            if let Some((y, pt)) = prev {
+                let number = pt.strip_suffix('.').is_some_and(|d| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit()));
+                out.push(if (pos.y - y).abs() > 0.5 { '\n' } else if number { ' ' } else { '\t' });
+            }
+            out.push_str(&t[byte_of(t, a)..byte_of(t, b)]);
+            prev = Some((pos.y, t));
+        }
+        out
+    }
+
+    /// The selection's ends for tests: (piece, character), in order.
+    #[cfg(test)]
+    pub fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.sel.filter(|s| !s.is_empty()).map(|s| s.span())
+    }
+
+    /// Where the `ch`th character of the text piece holding `needle` was drawn, for a
+    /// simulated press.
+    #[cfg(test)]
+    pub fn char_pos(&self, needle: &str, ch: usize) -> Option<Pos2> {
+        let l = self.laid.as_ref()?;
+        let (pos, g) = texts(&l.pieces).find(|(_, g)| g.text().contains(needle))?;
+        let ci = g.text()[..g.text().find(needle)?].chars().count() + ch;
+        Some(self.origin + pos.to_vec2() + g.pos_from_cursor(egui::text::CCursor::new(ci)).center().to_vec2())
     }
     /// Where a link to `url` was drawn last, for a simulated click.
     #[cfg(test)]
@@ -1628,6 +1670,56 @@ impl Writer<'_, '_> {
     }
 }
 
+/// The laid-out text pieces in reading order: where each was put, and its galley.
+fn texts(pieces: &[Piece]) -> impl Iterator<Item = (Pos2, &Arc<Galley>)> {
+    pieces.iter().filter_map(|p| match p {
+        Piece::Text { pos, g, .. } => Some((*pos, g)),
+        _ => None,
+    })
+}
+
+/// The byte of `t` where character `c` starts.
+fn byte_of(t: &str, c: usize) -> usize {
+    t.char_indices().nth(c).map_or(t.len(), |(b, _)| b)
+}
+
+/// The place in the document nearest `q` (document coordinates): in a piece on its line,
+/// else the end of the last piece above it, else the start of the first.
+fn hit(pieces: &[Piece], q: Pos2) -> crate::textsel::At {
+    let (mut best, mut above): (Option<(f32, crate::textsel::At)>, Option<crate::textsel::At>) = (None, None);
+    for (k, (pos, g)) in texts(pieces).enumerate() {
+        let r = Rect::from_min_size(pos, g.size());
+        if q.y >= r.top() && q.y <= r.bottom() {
+            let dx = if q.x < r.left() { r.left() - q.x } else { (q.x - r.right()).max(0.0) };
+            if best.is_none_or(|b| dx < b.0) {
+                best = Some((dx, (k, g.cursor_from_pos(q - pos).index)));
+            }
+        } else if r.bottom() < q.y {
+            above = Some((k, g.text().chars().count()));
+        }
+    }
+    best.map(|b| b.1).or(above).unwrap_or((0, 0))
+}
+
+/// Paint the selected characters `a..b` of a galley drawn at `at`; `on` the selection
+/// goes on past them (its line break shows as a sliver).
+fn paint_sel(p: &egui::Painter, at: Pos2, g: &Galley, a: usize, b: usize, on: bool, pal: &Palette) {
+    let mut c = 0;
+    let last = g.rows.len().saturating_sub(1);
+    for (i, row) in g.rows.iter().enumerate() {
+        let n = row.char_count_excluding_newline();
+        let (x, y) = (a.max(c), b.min(c + n));
+        let tail = (b > c + n || on && b >= c + n) && (row.ends_with_newline || i == last);
+        if x < y || tail && x <= c + n {
+            let rr = row.rect().translate(at.to_vec2());
+            let x0 = at.x + row.pos.x + row.x_offset(x - c);
+            let x1 = at.x + row.pos.x + row.x_offset(y.max(x) - c) + if tail { 4.0 } else { 0.0 };
+            crate::textsel::paint(p, Rect::from_min_max(pos2(x0, rr.top()), pos2(x1, rr.bottom())), pal);
+        }
+        c += row.char_count_including_newline();
+    }
+}
+
 /// What a click on a link asks for.
 pub enum Follow {
     Url(String),
@@ -1708,15 +1800,37 @@ pub fn view(ui: &mut Ui, body: Rect, v: &mut View, size: f32, pal: &Palette, spa
         area = area.vertical_scroll_offset(y);
     }
     area.show_viewport(&mut inner, |ui, vp| {
-        let (r, resp) = ui.allocate_exact_size(vec2(vp.width(), laid.height + margin * 2.0), Sense::click());
+        let (r, resp) = ui.allocate_exact_size(vec2(vp.width(), laid.height + margin * 2.0), Sense::click_and_drag());
         let origin = r.min + vec2(margin, margin);
         v.origin = origin;
+        let pieces = &laid.pieces;
+        let piece_text = |k: usize| texts(pieces).nth(k).map(|(_, g)| g.text()).unwrap_or("");
+        let word = |(k, c): crate::textsel::At| {
+            let t = piece_text(k);
+            let (x, y) = crate::textsel::word(t, byte_of(t, c));
+            ((k, t[..x].chars().count()), (k, t[..y].chars().count()))
+        };
+        // A line of a code block, else the whole paragraph.
+        let line = |(k, c): crate::textsel::At| {
+            let t = piece_text(k);
+            let b = byte_of(t, c);
+            let x = t[..b].rfind('\n').map_or(0, |i| i + 1);
+            let y = t[b..].find('\n').map_or(t.len(), |i| b + i);
+            ((k, t[..x].chars().count()), (k, t[..y].chars().count()))
+        };
+        crate::textsel::track(ui, &resp, &mut v.sel, |pp| hit(pieces, pp - origin.to_vec2()), word, line);
+        let sel = v.sel.filter(|s| !s.is_empty()).map(|s| s.span());
+        let mut k = 0;
         let vis = vp.translate(r.min.to_vec2()).expand(40.0);
         let p = ui.painter();
         let hover = resp.hover_pos();
         let tex = ui.fonts(|f| f.font_image_size());
         let mut over: Option<u32> = None;
         for piece in &laid.pieces {
+            let tk = matches!(piece, Piece::Text { .. }).then(|| {
+                k += 1;
+                k - 1
+            });
             let pr = piece.rect().translate(origin.to_vec2());
             if !pr.intersects(vis) {
                 continue;
@@ -1724,6 +1838,12 @@ pub fn view(ui: &mut Ui, body: Rect, v: &mut View, size: f32, pal: &Palette, spa
             match piece {
                 Piece::Text { pos, g, bold, links } => {
                     let at = origin + pos.to_vec2();
+                    if let (Some(((k0, c0), (k1, c1))), Some(tk)) = (sel, tk) {
+                        if (k0..=k1).contains(&tk) {
+                            let n = g.text().chars().count();
+                            paint_sel(p, at, g, if tk == k0 { c0 } else { 0 }, if tk == k1 { c1.min(n) } else { n }, tk < k1, pal);
+                        }
+                    }
                     p.galley(at, g.clone(), pal.text);
                     if let Some(b) = bold {
                         p.add(faux_bold(b, at + vec2((size / 24.0).clamp(0.45, 0.9), 0.0), tex));

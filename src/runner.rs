@@ -24,6 +24,9 @@ pub struct Options {
     pub size: [f32; 2],
     pub min_size: [f32; 2],
     pub icon: (Vec<u8>, u32, u32),
+    /// A picker window: the app's request it answers (no single-instance socket, no
+    /// "Show in folder" name; those are the main window's).
+    pub picker: Option<Box<crate::picker::Picker>>,
 }
 
 enum UserEvent {
@@ -165,6 +168,9 @@ impl Runner {
         let shot = match self.tk.as_mut() {
             Some(tk) => {
                 input.events.extend(tk.take());
+                if crate::testkit::held().any() {
+                    input.modifiers = crate::testkit::held();
+                }
                 if let Some(m) = input.events.iter().rev().find_map(|e| match e {
                     egui::Event::PointerButton { modifiers, .. } | egui::Event::Key { modifiers, .. } => Some(*modifiers),
                     _ => None,
@@ -262,6 +268,9 @@ impl ApplicationHandler<UserEvent> for Runner {
             return;
         }
         let gl = create_gl(el, &self.opts);
+        if let Some(p) = &self.opts.picker {
+            crate::picker::set_parent(&gl.window, &p.pick.parent);
+        }
         let painter = egui_glow::Painter::new(gl.glow.clone(), "", None, true).or_die("Could not create the painter");
         #[allow(unused_mut)]
         let mut state = egui_winit::State::new(self.ctx.clone(), egui::ViewportId::ROOT, el, Some(gl.window.scale_factor() as f32), el.system_theme(), Some(painter.max_texture_side()));
@@ -287,6 +296,15 @@ impl ApplicationHandler<UserEvent> for Runner {
             });
         }
         let mut app = App::new(&self.ctx, self.paths.take().unwrap_or_default());
+        if let Some(p) = self.opts.picker.take() {
+            app.picker = Some(p);
+            self.app = Some(app);
+            gl.window.request_redraw();
+            self.gl = Some(gl);
+            self.state = Some(state);
+            self.painter = Some(painter);
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         if let Some((l, sock)) = self.listener.take() {
             let p = self.proxy.clone();

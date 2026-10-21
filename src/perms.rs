@@ -101,7 +101,7 @@ pub fn groups() -> Vec<(u32, String)> {
     v
 }
 
-fn read_ids(file: &str) -> Vec<(u32, String)> {
+pub(crate) fn read_ids(file: &str) -> Vec<(u32, String)> {
     std::fs::read_to_string(file).unwrap_or_default().lines().filter_map(|l| {
         let mut it = l.split(':');
         let name = it.next()?.to_string();

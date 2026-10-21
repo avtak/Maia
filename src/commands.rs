@@ -39,21 +39,25 @@ impl Cmd {
             Cmd::GroupFree => G::FreeSpace,
             Cmd::GroupFs => G::FileSystem,
             Cmd::GroupFull => G::PercentFull,
+            Cmd::GroupTag => G::Tag,
+            Cmd::GroupTaken => G::Taken,
             _ => return None,
         })
     }
 }
 
 /// Every "Group By …" command, in menu order.
-pub const GROUP_CMDS: [Cmd; 14] = [
+pub const GROUP_CMDS: [Cmd; 16] = [
     Cmd::GroupNone,
     Cmd::GroupName,
     Cmd::GroupSize,
     Cmd::GroupCreated,
     Cmd::GroupDate,
     Cmd::GroupAccessed,
+    Cmd::GroupTaken,
     Cmd::GroupItems,
     Cmd::GroupType,
+    Cmd::GroupTag,
     Cmd::GroupUsage,
     Cmd::GroupDeleted,
     Cmd::GroupOriginal,
@@ -191,13 +195,18 @@ commands! {
     SelectDifferences, "select_differences", Panels, "Select Differences", "Select the entries Compare Panels marks in this panel.", [];
     SyncPanels, "sync_to_other_panel", Panels, "Sync To Other Panel", "Copy what is missing or newer here into the other panel's folder.", [];
     TerminalPanel, "terminal_panel", Panels, "Terminal Panel", "Show a terminal under the files that follows the folder shown.", ["Ctrl+Backtick"];
+    NewTerminal, "new_terminal", Panels, "New Terminal", "Open another shell in the terminal panel, in the folder shown. Ctrl+Shift+T does it too while the terminal has the keyboard.", [];
+    CloseTerminal, "close_terminal", Panels, "Close Terminal", "Close the shell shown in the terminal panel; the panel closes with the last one. Ctrl+Shift+W in the terminal.", [];
+    NextTerminal, "next_terminal", Panels, "Next Terminal", "Show the next shell in the terminal panel. Ctrl+Shift+PageDown in the terminal.", [];
+    PrevTerminal, "prev_terminal", Panels, "Previous Terminal", "Show the shell before in the terminal panel. Ctrl+Shift+PageUp in the terminal.", [];
+    FindInTerminal, "find_in_terminal", Panels, "Find in Terminal", "Search what the shell shown wrote, scrollback included: Enter for the next match, Shift+Enter for the one before. Ctrl+Shift+F in the terminal.", [];
 
     ToggleFlatten, "toggle_flatten", View, "Toggle Expand Folder", "Show every file under this folder in one flat, searchable list.", ["Ctrl+E"];
-    FocusFilter, "focus_filter", View, "Focus Filter", "Put the cursor in the filter box.", ["Ctrl+F"];
+    FocusFilter, "focus_filter", View, "Focus Filter", "Put the cursor in the filter box. It also takes size>10M, modified<7d, type:pictures, ext:pdf, owner:root, /regex/, a | b and -word.", ["Ctrl+F"];
     MeaningSearch, "search_meaning", View, "Search Everywhere", "Find files and folders in your home folder by name, and by what they are about with search by meaning on.", ["Ctrl+K"];
     ContentSearch, "search_contents", View, "Search File Contents", "Switch the filter between file names and the text inside files.", ["Ctrl+Shift+F"];
     SaveSmart, "save_smart_folder", View, "Save As Smart Folder…", "Keep this folder's search in the sidebar, searched again each time it opens.", [];
-    NewSmart, "new_smart_folder", View, "New Smart Folder…", "A saved search in the sidebar: a folder and what to find in it, by name, kind, date or size.", [];
+    NewSmart, "new_smart_folder", View, "New Smart Folder…", "A saved search in the sidebar: a folder and what to find in it, written as in the filter.", [];
     CodeSearch, "search_code", View, "Search Code", "Find text in this project's files, by word, case or regular expression.", ["Ctrl+Alt+F"];
     FindTodos, "find_todos", View, "Find TODOs", "List every TODO, FIXME, HACK and XXX comment in this project.", [];
     ViewPictures, "view_pictures", View, "View Pictures", "Show this folder's pictures full window, from the one under the cursor; Space plays them as a slideshow.", ["F3"];
@@ -216,6 +225,7 @@ commands! {
     ViewMedium, "view_medium", View, "View Medium Icons", "A grid of medium icons.", ["Ctrl+Shift+4"];
     ViewLarge, "view_large", View, "View Large Icons", "A grid of large thumbnails.", ["Ctrl+Shift+5"];
     ViewXL, "view_xl", View, "View XL Icons", "The biggest thumbnails.", ["Ctrl+Shift+6"];
+    ViewColumns, "view_columns", View, "View Columns", "One column per folder, from your home folder or the drive down to this one.", ["Ctrl+Shift+7"];
     GroupNone, "group_none", Group, "Clear Grouping", "List everything in one run, without group headers.", [];
     GroupName, "group_name", Group, "Group By Name", "Alphabetical ranges.", [];
     GroupType, "group_type", Group, "Group By Type", "One group per file type.", [];
@@ -230,6 +240,8 @@ commands! {
     GroupFree, "group_free_space", Group, "Group By Free Space", "Drives by free space (Computer only).", [];
     GroupFs, "group_file_system", Group, "Group By File System", "Drives by file system (Computer only).", [];
     GroupFull, "group_percent_full", Group, "Group By Percent Full", "Drives by how full they are (Computer only).", [];
+    GroupTag, "group_tag", Group, "Group By Tag", "One group per tag, colour labels first; an item shows under its first tag only.", [];
+    GroupTaken, "group_date_taken", Group, "Group By Date Taken", "Photos and films by the month they were taken, newest first.", [];
     GroupExpandAll, "group_expand_all", Group, "Expand All Groups", "Open every group.", [];
     GroupCollapseAll, "group_collapse_all", Group, "Collapse All Groups", "Close every group, leaving just the headers.", [];
     SavedView, "saved_view_settings", View, "Saved View Settings", "Remember this view for this folder, its subfolders, or everywhere.", [];
@@ -239,6 +251,10 @@ commands! {
     SortModified, "sort_modified", Sort, "Sort By Date Modified", "Sort by modification time (newest first); repeat to reverse.", ["Ctrl+Alt+3"];
     SortType, "sort_type", Sort, "Sort By Type", "Sort by type; repeat to reverse.", ["Ctrl+Alt+4"];
     SortCreated, "sort_created", Sort, "Sort By Date Created", "Sort by creation time; repeat to reverse.", [];
+    SortTags, "sort_tags", Sort, "Sort By Tag", "By each item's first tag: colour labels in their order, then words A to Z; untagged last.", [];
+    SortTaken, "sort_date_taken", Sort, "Sort By Date Taken", "Photos by when they were taken, films by when they were made (newest first); the rest last.", [];
+    SortDimensions, "sort_dimensions", Sort, "Sort By Dimensions", "Pictures and films by their pixels (largest first); the rest last.", [];
+    SortDuration, "sort_duration", Sort, "Sort By Duration", "Recordings and films by how long they play (longest first); the rest last.", [];
     SortNameAsc, "sort_name_asc", Sort, "Sort By Name Asc", "Sort A to Z.", [];
     SortNameDesc, "sort_name_desc", Sort, "Sort By Name Desc", "Sort Z to A.", [];
     SortSizeAsc, "sort_size_asc", Sort, "Sort By Size Asc", "Smallest first (folders by their content size).", [];
@@ -261,11 +277,14 @@ commands! {
     GitBranches, "git_branches", Inspector, "Git Branches", "Switch or create a branch, use the stash, open another work tree.", [];
     OnlyChanged, "only_changed", View, "Show Only Changed Files", "List only what git marks as changed in this folder, and the folders with changes inside; again to show everything.", ["Ctrl+Shift+G"];
     GitChanges, "git_changes", Inspector, "Show Git Changes", "Stage, discard and commit this repository's changes, in the inspector.", [];
+    GitSearch, "search_git_history", Inspector, "Search Git History", "The commits whose message, author or hash has the words typed; author:, path:, since: and until: narrow them further. Ctrl+F does it too in an open history.", [];
     Properties, "properties", Inspector, "Properties", "Details, sizes and permissions of the selection.", ["Alt+Enter"];
 
     Copy, "copy", Files, "Copy", "Copy the selection to the clipboard.", ["Ctrl+C", "Ctrl+Insert"];
     Cut, "cut", Files, "Cut", "Cut the selection to move it on paste.", ["Ctrl+X"];
     Paste, "paste", Files, "Paste", "Paste files here (or into the single selected folder).", ["Ctrl+V", "Shift+Insert"];
+    CopyTo, "copy_to", Files, "Copy To…", "Copy the selection into a folder picked as in Go To, the folders copied and moved to last first.", ["Shift+F5"];
+    MoveTo, "move_to", Files, "Move To…", "Move the selection into a folder picked as in Go To, the folders copied and moved to last first.", ["Shift+F6"];
     CopyPath, "copy_path", Files, "Copy As Path", "Copy full paths, quoted when needed; the folder if nothing is selected.", ["Ctrl+Shift+C"];
     CopyPathRaw, "copy_path_raw", Files, "Copy As Path (Raw)", "Copy full paths without any quoting.", [];
     CopyName, "copy_name", Files, "Copy Name", "Copy just the file names.", [];
@@ -312,6 +331,7 @@ commands! {
     ContextMenu, "context_menu", Files, "Context Menu", "Open the action menu at the file cursor.", ["Shift+F10"];
     RestoreTrash, "restore_trash", Files, "Restore From Trash", "Put trashed items back where they came from.", [];
     Undo, "undo", Files, "Undo", "Reverse the last rename, move, copy, create or trash.", ["Ctrl+Z"];
+    Redo, "redo", Files, "Redo", "Do again what Undo took back.", ["Ctrl+Shift+Z", "Ctrl+Y"];
     UndoHistory, "undo_history", Files, "Undo History…", "The changes Undo can take back, newest first; take back several at once.", ["Ctrl+Alt+Z"];
     EmptyTrash, "empty_trash", Files, "Empty Trash", "Permanently remove everything in the trash (asks first).", [];
     ExtractHere, "extract_here", Files, "Extract Here", "Unpack the selected archives (or what is selected inside one) beside them.", [];
@@ -337,6 +357,7 @@ commands! {
     SelectNone, "select_none", Selection, "Select None", "Clear the selection.", ["Ctrl+Shift+A"];
     InvertSelection, "invert_selection", Selection, "Invert Selection", "Select what isn't selected and vice versa.", [];
     ToggleSelection, "toggle_selection", Selection, "Toggle Selection", "Select or unselect the item under the cursor.", ["Ctrl+Space"];
+    SelectMatching, "select_matching", Selection, "Select Matching…", "Add what is shown whose name matches a pattern to the selection, ignoring case: *.jpg, IMG_*, *.{png,jpg}, or src/*.rs in a flattened folder.", [];
 
     SaveLayout, "save_layout", Layouts, "Save Layout As…", "Save panels, tabs and window size under a name.", [];
     LoadLayout, "load_layout", Layouts, "Load Layout…", "Switch to a saved layout.", [];

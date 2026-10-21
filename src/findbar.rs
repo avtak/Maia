@@ -125,6 +125,11 @@ pub fn bar(ui: &mut Ui, body: Rect, f: &mut Finder, count: &str, any: bool, id: 
     }
     let ease = 1.0 - (1.0 - t) * (1.0 - t);
     let rows = if f.replace.is_some() { 2.0 } else { 1.0 };
+    // A body shorter than the bar (a terminal pane closing or squeezed by a small
+    // window) shows none of it, rather than a bar reaching up over what is above.
+    if body.height() < BAR_H * rows {
+        return (Out::None, body);
+    }
     let h = (BAR_H * rows * ease).round();
     let bar = Rect::from_min_max(pos2(body.left(), body.bottom() - h), body.max);
     let mut out = Out::None;
@@ -153,8 +158,11 @@ pub fn bar(ui: &mut Ui, body: Rect, f: &mut Finder, count: &str, any: bool, id: 
                 out = o;
             }
         }
-        let (cr, _) = ui.allocate_exact_size(cg.size() + vec2(10.0, 0.0), Sense::hover());
-        ui.painter().galley(pos2(cr.left() + 4.0, cr.center().y - cg.size().y / 2.0), cg, pal.text_dim);
+        // In a narrow panel the field keeps room to type in; the count gives way.
+        if ui.available_width() - cg.size().x - 10.0 >= 40.0 {
+            let (cr, _) = ui.allocate_exact_size(cg.size() + vec2(10.0, 0.0), Sense::hover());
+            ui.painter().galley(pos2(cr.left() + 4.0, cr.center().y - cg.size().y / 2.0), cg, pal.text_dim);
+        }
         let te = egui::TextEdit::singleline(&mut f.query).id(fid).hint_text(egui::RichText::new("Find").color(pal.text_dim)).frame(false).desired_width(ui.available_width()).font(FontId::proportional(12.5));
         r = Some(ui.add(te));
     });

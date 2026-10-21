@@ -1,10 +1,11 @@
 //! Desktop integration: install to ~/.local, launcher entry, icon, default file manager.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Maia, the brightest star of the Pleiades, crossing a dark tile.
-pub const ICON_SVG: &str = include_str!("../assets/maia.svg");
+/// A folder of dark frosted glass with papers standing in it. A PNG because the glass
+/// is a blur, which the SVG renderer doesn't draw.
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/maia.png");
 
 fn local() -> PathBuf {
     dirs::data_dir().unwrap_or_else(|| crate::fsx::home().join(".local/share"))
@@ -18,8 +19,46 @@ fn desktop_path() -> PathBuf {
     local().join("applications/io.github.yappologistic.Maia.desktop")
 }
 
-fn icon_path() -> PathBuf {
-    local().join("icons/hicolor/scalable/apps/io.github.yappologistic.Maia.svg")
+fn hicolor() -> PathBuf {
+    local().join("icons/hicolor")
+}
+
+pub fn icon_in(hicolor: &Path) -> PathBuf {
+    hicolor.join("256x256/apps/io.github.yappologistic.Maia.png")
+}
+
+/// Where earlier versions put the icon. A scalable icon matches every size, so left
+/// beside the PNG it would go on being the one shown.
+pub fn old_icon_in(hicolor: &Path) -> PathBuf {
+    hicolor.join("scalable/apps/io.github.yappologistic.Maia.svg")
+}
+
+/// Puts this build's icon under `hicolor` and takes away the old SVG. Writes nothing
+/// when the icon there is already this one; returns whether anything changed.
+pub fn place_icon(hicolor: &Path) -> std::io::Result<bool> {
+    let old = std::fs::remove_file(old_icon_in(hicolor)).is_ok();
+    let p = icon_in(hicolor);
+    if std::fs::read(&p).is_ok_and(|b| b == ICON_PNG) {
+        return Ok(old);
+    }
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = p.with_extension("png.new");
+    std::fs::write(&tmp, ICON_PNG)?;
+    std::fs::rename(&tmp, &p)?;
+    // The icon theme spec's signal to rescan: an icon cache older than the theme
+    // folder is not trusted.
+    let _ = std::fs::File::open(hicolor).and_then(|d| d.set_modified(std::time::SystemTime::now()));
+    Ok(true)
+}
+
+/// An installed copy replaced in place (build-dist.sh, an update of the bare binary or
+/// AppImage) brings the launcher's icon up to date with itself.
+pub fn refresh_icon() {
+    if installed_here() {
+        let _ = place_icon(&hicolor());
+    }
 }
 
 /// 0 not looked at yet, 1 not installed, 2 this program is the installed one.
@@ -52,8 +91,7 @@ pub fn install() -> Result<String, String> {
         std::fs::copy(&exe, &tmp).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &bin).map_err(|e| e.to_string())?;
     }
-    std::fs::create_dir_all(icon_path().parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(icon_path(), ICON_SVG).map_err(|e| e.to_string())?;
+    place_icon(&hicolor()).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(desktop_path().parent().unwrap()).map_err(|e| e.to_string())?;
     let desktop = format!(
         "[Desktop Entry]\nType=Application\nName=Maia\nGenericName=File Manager\nComment=Fast, keyboard-first file manager\nExec={} %U\nIcon=io.github.yappologistic.Maia\nTerminal=false\nCategories=System;FileTools;FileManager;\nMimeType=inode/directory;\nKeywords=files;folders;explorer;browser;\nStartupWMClass=io.github.yappologistic.Maia\nActions=new-window;\n\n[Desktop Action new-window]\nName=New Window\nExec={} --window \"{}\"\n",
@@ -141,7 +179,15 @@ pub fn uninstall() -> Result<String, String> {
     }
     #[cfg(not(test))]
     let _ = crate::fm1::set_service(false, &crate::fm1::exe());
-    for p in [desktop_path(), icon_path()] {
+    // Open and Save dialogs go back to the desktop's, and the backend's files go.
+    #[cfg(not(test))]
+    {
+        let pl = crate::portal::Places::user();
+        if crate::portal::is_on(&pl) || pl.portal_file().exists() || pl.service_file().exists() {
+            let _ = crate::portal::set(false);
+        }
+    }
+    for p in [desktop_path(), icon_in(&hicolor()), old_icon_in(&hicolor())] {
         let _ = std::fs::remove_file(p);
     }
     let bin = bin_path();
@@ -152,16 +198,10 @@ pub fn uninstall() -> Result<String, String> {
     Ok("Maia uninstalled (settings were kept)".into())
 }
 
-/// The window icon: the launcher icon rendered at 64 px (straight alpha, as winit wants).
+/// The window icon: the launcher icon at 64 px, for X11 window lists and docks
+/// (Wayland ones find the launcher's icon through the app id).
 pub fn window_icon() -> (Vec<u8>, u32, u32) {
-    let Some((w, h, mut px)) = crate::svg::render(ICON_SVG.as_bytes(), 64) else { return (vec![0; 4], 1, 1) };
-    for p in px.chunks_exact_mut(4) {
-        let a = p[3] as u32;
-        if a > 0 && a < 255 {
-            for c in &mut p[..3] {
-                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
-            }
-        }
-    }
-    (px, w, h)
+    let Some(img) = crate::imgdec::decode_bytes(ICON_PNG) else { return (vec![0; 4], 1, 1) };
+    let img = crate::imgdec::downscale(&img, 64);
+    (img.px, img.w, img.h)
 }

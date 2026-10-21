@@ -40,6 +40,16 @@ cargo build --release
 it out again. To have other apps open folders in Maia, turn on Options > Startup &
 system > Default file manager, or run `maia --set-default`.
 
+Maia can also be the Open and Save dialog of apps that ask the desktop portal for a
+file: turn on Options > Startup & system > Open and save dialog, or run
+`maia --set-picker` (`--unset-picker` gives it back). Chromium, Electron, Flatpak apps
+and GTK 4.18 or later ask the portal by themselves; Firefox does with
+`widget.use-xdg-desktop-portal.file-picker` set to 1 in `about:config`, GTK 3 apps with
+`GTK_USE_PORTAL=1` and Qt apps with `QT_QPA_PLATFORMTHEME=xdgdesktopportal`.
+xdg-desktop-portal older than 1.20.1 finds Maia only when it came from the .deb or .rpm.
+The dialog's window class is `io.github.yappologistic.Maia.Picker`, for a window rule
+that floats it.
+
 Maia uses these when they are installed and works without them: `bsdtar` and `7z`
 (archives), `ffmpeg` (video, sound, music tags), poppler (PDFs), LibreOffice (Office
 documents), ImageMagick (editing and converting pictures), `git`, `gio` (network
@@ -52,9 +62,13 @@ places), `udisksctl` (drives), `pkexec` (administrator retries), `sqlite3`, TeX
 maia [PATH...]
 ```
 
-Start typing to filter the folder you are in; the filter also takes conditions such as
-`size>100M`, `modified<7d` or `tag:red`. Every command is in the palette, Ctrl+Shift+P,
-with its hotkey, and every hotkey can be changed there. Some to start with:
+Start typing to filter the folder you are in. The filter also takes conditions:
+`size>100M`, `modified<7d` (and `created`, `accessed`), `tag:red`, `type:pictures`,
+`ext:jpg,png`, `owner:root`, `*.rs`, `/^IMG_\d+/`, a `"quoted phrase"`. `a | b` (or
+`OR`) is either, `-draft` (or `NOT`) leaves out, and parentheses group. Save As Smart
+Folder keeps the whole filter in the sidebar. Every command is in the palette,
+Ctrl+Shift+P, with its hotkey, and every hotkey can be changed there. Some to start
+with:
 
 | Action | Keys |
 |---|---|

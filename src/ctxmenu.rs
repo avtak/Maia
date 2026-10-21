@@ -31,7 +31,39 @@ pub enum Act {
     NewTag,
     /// A smart folder's entry in the sidebar: (what, its id, panel to act in).
     Smart(SmartAct, u64, u64),
+    /// Copy what is selected in a panel's preview (true), or select all of it.
+    Preview(bool, u64),
+    /// A tag in the sidebar: (what, the tag, panel to act in).
+    TagPlace(TagAct, String, u64),
     None,
+}
+
+#[derive(Clone, Copy)]
+pub enum TagAct {
+    Open,
+    NewTab,
+    Rename,
+    Remove,
+}
+
+/// The menu of a tag in the sidebar. A colour label keeps its name.
+pub fn build_tag(panel: u64, tag: &str, pos: Pos2) -> Popup {
+    let it = |key: &str, label: &str, a: TagAct| Item { id: format!("tagplace:{key}"), label: label.into(), act: Act::TagPlace(a, tag.to_string(), panel), children: vec![] };
+    let mut items = vec![it("open", "Open", TagAct::Open), it("new_tab", "Open In New Tab", TagAct::NewTab), Item::sep()];
+    if crate::tags::color_of(tag).is_none() {
+        items.push(it("rename", "Rename Tag…", TagAct::Rename));
+    }
+    items.push(it("remove", "Remove From All Files…", TagAct::Remove));
+    let key = smart_key(crate::smart::tag_id(tag));
+    Popup::Ctx(CtxState { sidebar: Some(key), pos, items, query: String::new(), sel: 0, expanded: HashSet::new(), targets: vec![], focus: true, reveal: None })
+}
+
+/// "notes.txt", "3 items": what a tag change was made to, for Undo's list.
+fn what_tagged(paths: &[PathBuf]) -> String {
+    match paths {
+        [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        v => format!("{} items", v.len()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +86,13 @@ pub fn build_smart(panel: u64, id: u64, pos: Pos2) -> Popup {
     let it = |key: &str, label: &str, a: SmartAct| Item { id: format!("smart:{key}"), label: label.into(), act: Act::Smart(a, id, panel), children: vec![] };
     let items = vec![it("open", "Open", SmartAct::Open), it("new_tab", "Open In New Tab", SmartAct::NewTab), Item::sep(), it("edit", "Edit…", SmartAct::Edit), it("rename", "Rename…", SmartAct::Rename), Item::sep(), it("remove", "Remove", SmartAct::Remove)];
     Popup::Ctx(CtxState { sidebar: Some(smart_key(id)), pos, items, query: String::new(), sel: 0, expanded: HashSet::new(), targets: vec![], focus: true, reveal: None })
+}
+
+/// The menu of a selection in panel `panel`'s preview.
+pub fn build_preview(panel: u64, pos: Pos2) -> Popup {
+    let it = |key: &str, label: &str, copy: bool| Item { id: format!("preview:{key}"), label: label.into(), act: Act::Preview(copy, panel), children: vec![] };
+    let items = vec![it("copy", "Copy", true), it("select_all", "Select All", false)];
+    Popup::Ctx(CtxState { sidebar: None, pos, items, query: String::new(), sel: 0, expanded: HashSet::new(), targets: vec![], focus: true, reveal: None })
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +192,12 @@ pub fn build(app: &mut App, panel: u64, pos: Pos2, background: bool) -> Popup {
     let ents: Vec<(PathBuf, bool, bool, String)> = if background { vec![] } else { t.target_entries().iter().map(|e| (e.path.clone(), e.is_dir, e.is_link, e.ext().to_string())).collect() };
     let mut items = vec![];
     if ents.is_empty() {
+        if t.archive.as_deref().is_some_and(|a| crate::archwrite::kind(a).is_ok()) {
+            // Inside a zip, 7z or tarball: what can be made in it.
+            items.push(Item::cmd(Cmd::NewFolder));
+            items.push(Item::cmd(Cmd::Paste));
+            items.push(Item::sep());
+        }
         if !computer && t.archive.is_none() {
             items.push(Item::cmd(Cmd::NewFolder));
             items.push(Item::cmd(Cmd::NewFile));
@@ -172,6 +217,7 @@ pub fn build(app: &mut App, panel: u64, pos: Pos2, background: bool) -> Popup {
             Item::labeled(Cmd::ViewMedium, "Medium icons"),
             Item::labeled(Cmd::ViewLarge, "Large icons"),
             Item::labeled(Cmd::ViewXL, "Extra large icons"),
+            Item::labeled(Cmd::ViewColumns, "Columns"),
         ]));
         items.push(Item::sub("sort", "Sort by", vec![
             Item::labeled(Cmd::SortName, "Name"),
@@ -216,10 +262,17 @@ pub fn build(app: &mut App, panel: u64, pos: Pos2, background: bool) -> Popup {
             items.push(Item::cmd(Cmd::Properties));
         }
     } else if t.archive.is_some() {
-        // Inside an archive: open, copy out, extract.
+        // Inside an archive: open, copy out, extract; in one Maia can write, rename and
+        // delete too.
         items.push(Item::labeled(Cmd::Activate, "Open"));
         items.push(Item::cmd(Cmd::Copy));
+        items.push(Item::cmd(Cmd::CopyTo));
         items.push(Item::cmd(Cmd::ExtractHere));
+        if t.archive.as_deref().is_some_and(|a| crate::archwrite::kind(a).is_ok()) {
+            items.push(Item::sep());
+            items.push(Item::cmd(Cmd::Rename));
+            items.push(Item::labeled(Cmd::Trash, "Delete"));
+        }
     } else if computer {
         let drives: Vec<crate::drives::Drive> = ents.iter().filter_map(|e| app.drive_at(&e.0)).collect();
         let mounted: Vec<&PathBuf> = ents.iter().filter(|e| tab::drive_dev(&e.0).is_none()).map(|e| &e.0).collect();
@@ -309,6 +362,8 @@ pub fn build(app: &mut App, panel: u64, pos: Pos2, background: bool) -> Popup {
         if single && all_dirs {
             items.push(Item::labeled(Cmd::Paste, "Paste Into Folder"));
         }
+        items.push(Item::cmd(Cmd::CopyTo));
+        items.push(Item::cmd(Cmd::MoveTo));
         let mut copy = vec![Item::cmd(Cmd::CopyPath), Item::cmd(Cmd::CopyPathRaw), Item::cmd(Cmd::CopyName), Item::cmd(Cmd::CopyPathRelative)];
         // path:line, for the file a search showed a line of.
         if p.line_hint.as_ref().is_some_and(|h| ents.iter().any(|e| e.0 == h.0)) {
@@ -586,10 +641,10 @@ pub fn draw(app: &mut App, ctx: &egui::Context, st: &mut CtxState) -> bool {
         }
     }
     // Current choices, shown as radio marks on View / Sort by / Group by entries.
-    let (cur_group, cur_sort, cur_zoom) = app.panels.get(&app.active).map(|p| {
+    let (cur_group, cur_sort, cur_zoom, cur_columns) = app.panels.get(&app.active).map(|p| {
         let s = &p.tab().settings;
-        (s.group, s.sort, s.zoom)
-    }).unwrap_or((crate::config::GroupBy::None, crate::config::SortKey::Name, 0.0));
+        (s.group, s.sort, s.zoom, s.column_view)
+    }).unwrap_or((crate::config::GroupBy::None, crate::config::SortKey::Name, 0.0, false));
     let radio_of = |c: Cmd| -> Option<bool> {
         if let Some(g) = c.group_key() {
             return Some(g == cur_group);
@@ -615,7 +670,10 @@ pub fn draw(app: &mut App, ctx: &egui::Context, st: &mut CtxState) -> bool {
             Cmd::ViewXL => Some(1.0),
             _ => None,
         };
-        vz.map(|z: f32| crate::listing::view_name(z) == crate::listing::view_name(cur_zoom))
+        if c == Cmd::ViewColumns {
+            return Some(cur_columns);
+        }
+        vz.map(|z: f32| !cur_columns && crate::listing::view_name(z) == crate::listing::view_name(cur_zoom))
     };
     let screen = ctx.content_rect();
     let row_h = 24.0;
@@ -847,9 +905,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context, st: &mut CtxState) -> bool {
             }
             Act::Tag(tag, on) => {
                 let paths = app.tab().targets();
-                if let Err(e) = crate::tags::toggle(&paths, &tag, !on) {
-                    app.toast(format!("Couldn't tag {e}"));
-                }
+                let label = format!("{} {} {tag}", if on { "Untag" } else { "Tag" }, what_tagged(&paths));
+                let how = if on { crate::tags::How::Remove(tag) } else { crate::tags::How::Add(tag) };
+                crate::tags::start(app, crate::tags::Job::Edit(paths, how), crate::tags::Record::New(label));
             }
             Act::NewTag => {
                 let paths = app.tab().targets();
@@ -861,9 +919,8 @@ pub fn draw(app: &mut App, ctx: &egui::Context, st: &mut CtxState) -> bool {
                         if name.is_empty() {
                             return;
                         }
-                        if let Err(e) = crate::tags::toggle(&paths, &name, true) {
-                            app.toast(format!("Couldn't tag {e}"));
-                        }
+                        let label = format!("Tag {} {name}", what_tagged(&paths));
+                        crate::tags::start(app, crate::tags::Job::Edit(paths, crate::tags::How::Add(name)), crate::tags::Record::New(label));
                     }),
                 )));
             }
@@ -898,6 +955,25 @@ pub fn draw(app: &mut App, ctx: &egui::Context, st: &mut CtxState) -> bool {
                     SmartAct::Edit => app.actions.push(Action::Open(crate::smart::edit(&sf, true))),
                     SmartAct::Rename => app.actions.push(Action::Open(Popup::prompt("Rename smart folder", sf.name.clone(), Box::new(move |app: &mut App, name: String| app.rename_smart(id, name))))),
                     SmartAct::Remove => app.remove_smart(id),
+                }
+            }
+            Act::Preview(copy, panel) => crate::textsel::menu_act(app, panel, copy),
+            Act::TagPlace(a, tag, panel) => {
+                let id = crate::smart::tag_id(&tag);
+                match a {
+                    TagAct::Open => app.actions.push(Action::OpenSmart { panel, id, new_tab: false, focus: true }),
+                    TagAct::NewTab => app.actions.push(Action::OpenSmart { panel, id, new_tab: true, focus: true }),
+                    TagAct::Rename => app.actions.push(Action::Open(Popup::prompt(
+                        "Rename tag",
+                        tag.clone(),
+                        Box::new(move |app: &mut App, name: String| {
+                            let name = name.replace(',', " ").trim().to_string();
+                            if !name.is_empty() && name != tag {
+                                crate::tags::bulk(app, crate::tags::Bulk::Rename(tag, name));
+                            }
+                        }),
+                    ))),
+                    TagAct::Remove => crate::tags::bulk(app, crate::tags::Bulk::Remove(tag)),
                 }
             }
             Act::None => {}

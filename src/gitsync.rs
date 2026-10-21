@@ -1,6 +1,7 @@
-//! Sending and getting work: fetch, pull and push for the branch HEAD is on, and the
-//! conflicts a merge, rebase, cherry-pick or revert stops at, one at a time. git does the work on a worker
-//! and never asks for anything at a terminal; what it says is put in plain words.
+//! Sending and getting work: fetch, pull and push for the branch HEAD is on, merging
+//! another branch into it, and the conflicts a merge, rebase, cherry-pick or revert stops
+//! at, one at a time. git does the work on a worker and never asks for anything at a
+//! terminal; what it says is put in plain words.
 
 use std::path::Path;
 use std::time::Duration;
@@ -148,6 +149,61 @@ pub fn push(root: &Path, force: bool) -> Result<String, String> {
         (false, Some(n)) => format!("Pushed {} to {up}", commits(n)),
         (false, None) => format!("Pushed to {up}"),
     })
+}
+
+/// The files git names, one to a line under its message, as "a.txt, b.txt and 3 more".
+fn named(e: &str, after: &str) -> String {
+    let files: Vec<&str> = e.lines().skip_while(|l| !l.contains(after)).skip(1).take_while(|l| l.starts_with(['\t', ' '])).map(str::trim).filter(|l| !l.is_empty()).collect();
+    match files.as_slice() {
+        [] => "some files".into(),
+        [a] => (*a).into(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+    }
+}
+
+/// A refused merge in plain words: what is in the way, and what to do about it.
+pub fn merge_refusal(e: &str, what: &str, into: &str) -> String {
+    let l = e.to_lowercase();
+    if l.contains("your local changes to the following files would be overwritten") {
+        format!("Your uncommitted changes to {} would be overwritten by the merge. Commit or stash them first.", named(e, "would be overwritten"))
+    } else if l.contains("untracked working tree files would be overwritten") {
+        format!("The merge would overwrite {}, which git doesn't track. Move them away or commit them first.", named(e, "would be overwritten"))
+    } else if l.contains("unrelated histories") {
+        format!("{what} and {into} have no history in common, so git won't merge them.")
+    } else if l.contains("not something we can merge") {
+        format!("git doesn't know {what}.")
+    } else if l.contains("you have not concluded your merge") || l.contains("merge_head exists") {
+        "A merge is still in progress: continue or abort it on the Changes page first.".into()
+    } else {
+        explain(e)
+    }
+}
+
+/// Merge `what` (a branch, remote or local) into the branch HEAD is on. A fast-forward
+/// when git can: git's own `merge.ff` setting decides, as it would at a terminal; else a
+/// merge commit with git's message, no editor opened. Conflicts are left to the Changes
+/// page. What is said names the commit it was at, which Reset can go back to.
+pub fn merge(root: &Path, what: &str) -> Result<String, String> {
+    let into = branch(root).unwrap_or_else(|| "HEAD".into());
+    if let Some(d) = doing(root) {
+        return Err(format!("{} is still in progress: continue or abort it on the Changes page first.", d.label()));
+    }
+    let before = out(root, &["rev-parse", "HEAD"]).ok_or("There is no commit to merge into yet.")?;
+    // Hooks may run, as for a commit.
+    if let Err(e) = exec(root, &["merge", "--no-edit", "--quiet", what], Duration::from_secs(600)) {
+        if doing(root) == Some(Doing::Merge) && unmerged(root) > 0 {
+            return Err(CONFLICTS.into());
+        }
+        return Err(merge_refusal(&e, what, &into));
+    }
+    let after = out(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let was = &before[..before.len().min(7)];
+    if after == before {
+        return Ok(format!("{into} already has everything on {what}"));
+    }
+    let theirs = out(root, &["rev-parse", &format!("{what}^{{commit}}")]).unwrap_or_default();
+    Ok(if after == theirs { format!("Fast-forwarded {into} to {what} · it was at {was}") } else { format!("Merged {what} into {into} · it was at {was}") })
 }
 
 // ------------------------------------------------------------------ in the middle of one

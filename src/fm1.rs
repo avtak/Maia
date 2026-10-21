@@ -283,6 +283,12 @@ impl Bus {
         read(&mut self.s)
     }
 
+    /// The socket and the last serial used: for a service that reads on one thread and
+    /// answers from others (the Open and Save dialog).
+    pub fn into_parts(self) -> (UnixStream, u32) {
+        (self.s, self.serial)
+    }
+
     /// Call a method and wait for its answer (messages before it are skipped: none come
     /// to a fresh connection that has asked for nothing).
     pub fn call(&mut self, dest: &str, path: &str, iface: &str, member: &str, sig: &str, body: &[u8]) -> Option<Msg> {

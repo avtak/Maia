@@ -4,6 +4,7 @@
 //! programs (vim, htop, less) rely on.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use vte::{Params, Perform};
 
@@ -21,6 +22,8 @@ pub const HIDDEN: u32 = 1 << 27;
 /// The left half of a wide character; the right half is a `SPACER`.
 pub const WIDE: u32 = 1 << 28;
 pub const SPACER: u32 = 1 << 29;
+/// Part of a hyperlink (OSC 8): its address is in the row's `links`.
+pub const LINK: u32 = 1 << 30;
 pub const STYLE: u32 = BOLD | DIM | ITALIC | UNDERLINE | INVERSE | STRIKE | HIDDEN;
 const CHAR: u32 = (1 << 21) - 1;
 
@@ -63,6 +66,55 @@ pub struct Row {
     pub cells: Vec<Cell>,
     /// The text runs on into the next row (it reached the edge).
     pub wrapped: bool,
+    /// Hyperlinks over columns `from..to`. A cell is linked only while it is marked
+    /// `LINK` too, so text written over one or erased leaves it.
+    pub links: Vec<(u16, u16, Arc<str>)>,
+}
+
+impl Row {
+    fn blank(cols: usize) -> Row {
+        Row { cells: vec![Cell::BLANK; cols], ..Row::default() }
+    }
+
+    /// The address of the hyperlink at column `x`.
+    pub fn link(&self, x: usize) -> Option<&Arc<str>> {
+        let c = self.cells.get(x)?;
+        if c.flags() & LINK == 0 {
+            return None;
+        }
+        self.links.iter().rev().find(|l| (l.0 as usize..l.1 as usize).contains(&x)).map(|l| &l.2)
+    }
+}
+
+/// What a program asked to hear of the mouse (xterm's modes 9, 1000, 1002, 1003).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Track {
+    #[default]
+    Off,
+    Press,
+    Click,
+    Drag,
+    Motion,
+}
+
+/// How a mouse report is written: xterm's bytes, UTF-8 (1005), SGR (1006), urxvt (1015).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Enc {
+    #[default]
+    X10,
+    Utf8,
+    Sgr,
+    Urxvt,
+}
+
+/// A mouse event to report: a button (0 left, 1 middle, 2 right) pressed or let go, the
+/// pointer moving with one held (or none), the wheel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mouse {
+    Press(u8),
+    Release(u8),
+    Motion(Option<u8>),
+    Wheel(bool),
 }
 
 #[derive(Clone, Copy)]
@@ -122,7 +174,25 @@ pub struct Screen {
     /// How many rows the view is scrolled back.
     pub scroll: usize,
     last: char,
+    /// The hyperlink what is written next belongs to.
+    link: Option<Arc<str>>,
+    pub mouse: Track,
+    pub mouse_enc: Enc,
+    /// Counts changes to what is shown: a search of the text is current while it holds.
+    pub changes: u64,
 }
+
+/// Where a character of a line of text is on the screen (see `Screen::line_text`).
+#[derive(Clone, Copy, Debug)]
+pub struct Spot {
+    pub byte: u32,
+    pub n: u64,
+    pub x: u16,
+    pub w: u8,
+}
+
+/// Text on the screen from one cell to another, both included (lasting row, column).
+pub type Span = ((u64, usize), (u64, usize));
 
 /// DEC special graphics for `` ` `` to `~`: box drawing as ncurses uses it.
 const LINES: [char; 31] = [
@@ -141,7 +211,7 @@ impl Screen {
         Screen {
             cols,
             rows,
-            lines: (0..rows).map(|_| Row { cells: vec![Cell::BLANK; cols], wrapped: false }).collect(),
+            lines: (0..rows).map(|_| Row::blank(cols)).collect(),
             dropped: 0,
             main: None,
             cur: Cursor::default(),
@@ -161,6 +231,10 @@ impl Screen {
             replies: vec![],
             scroll: 0,
             last: ' ',
+            link: None,
+            mouse: Track::Off,
+            mouse_enc: Enc::X10,
+            changes: 0,
         }
     }
 
@@ -221,6 +295,151 @@ impl Screen {
         s
     }
 
+    /// The first and last rows of the line row `n` is part of: rows that ran on into the
+    /// next are one line (at most 64 rows each way, which no real line needs).
+    pub fn logical(&self, n: u64) -> (u64, u64) {
+        let wrapped = |k: u64| self.line(k).is_some_and(|r| r.wrapped);
+        let (mut a, mut b) = (n, n);
+        while a > self.dropped && n - a < 64 && wrapped(a - 1) {
+            a -= 1;
+        }
+        while b - n < 64 && wrapped(b) && self.line(b + 1).is_some() {
+            b += 1;
+        }
+        (a, b)
+    }
+
+    /// Rows `a..=b` as one line of text, and where each of its characters is: its byte in
+    /// the text, its row and column, and how many columns it takes.
+    pub fn line_text(&self, a: u64, b: u64, text: &mut String, at: &mut Vec<Spot>) {
+        text.clear();
+        at.clear();
+        for n in a..=b {
+            let Some(row) = self.line(n) else { continue };
+            for (x, c) in row.cells.iter().enumerate() {
+                if c.flags() & SPACER != 0 {
+                    continue;
+                }
+                at.push(Spot { byte: text.len() as u32, n, x: x as u16, w: if c.flags() & WIDE != 0 { 2 } else { 1 } });
+                text.push(c.ch());
+            }
+            // A row kept in the scrollback lost the blanks it ended in, which were text.
+            if row.wrapped && n < b {
+                for x in row.cells.len()..self.cols {
+                    at.push(Spot { byte: text.len() as u32, n, x: x as u16, w: 1 });
+                    text.push(' ');
+                }
+            }
+        }
+    }
+
+    /// Where `q` occurs in the scrollback and on the screen (a line that ran over several
+    /// rows is searched as one), as each match's first and last cell; at most `max`.
+    pub fn find(&self, q: &str, case: bool, max: usize, out: &mut Vec<Span>) {
+        out.clear();
+        let (mut text, mut at, mut found) = (String::new(), vec![], vec![]);
+        let end = self.dropped + self.lines.len() as u64;
+        let mut n = self.dropped;
+        while n < end && out.len() < max {
+            let mut b = n;
+            while b + 1 < end && b - n < 64 && self.line(b).is_some_and(|r| r.wrapped) {
+                b += 1;
+            }
+            self.line_text(n, b, &mut text, &mut at);
+            found.clear();
+            crate::findbar::find_in(&text, q, case, &mut found);
+            for &(s, e) in &found {
+                let first = at.partition_point(|p| p.byte < s);
+                let last = at.partition_point(|p| p.byte < e).saturating_sub(1);
+                if let (Some(f), Some(l)) = (at.get(first), at.get(last)) {
+                    out.push(((f.n, f.x as usize), (l.n, l.x as usize + l.w as usize - 1)));
+                }
+            }
+            n = b + 1;
+        }
+        out.truncate(max);
+    }
+
+    /// The word at a cell, as a double click takes it: letters, digits and what paths and
+    /// addresses are written with, or a run of blanks, or the one other character.
+    pub fn word(&self, p: (u64, usize)) -> Option<Span> {
+        let (a, b) = self.logical(p.0);
+        let (mut text, mut at) = (String::new(), vec![]);
+        self.line_text(a, b, &mut text, &mut at);
+        let chars: Vec<char> = text.chars().collect();
+        let i = at.iter().position(|s| s.n == p.0 && (s.x as usize..s.x as usize + s.w as usize).contains(&p.1))?;
+        let class = |c: char| if c.is_alphanumeric() || "_-./~:@%+#?&=".contains(c) { 1 } else if c == ' ' { 0 } else { 2 };
+        let k = class(chars[i]);
+        let (mut s, mut e) = (i, i);
+        if k != 2 {
+            while s > 0 && class(chars[s - 1]) == k {
+                s -= 1;
+            }
+            while e + 1 < chars.len() && class(chars[e + 1]) == k {
+                e += 1;
+            }
+            // Not the full stop or comma of the sentence it ends.
+            while e > i && ".,:;?!".contains(chars[e]) {
+                e -= 1;
+            }
+        }
+        Some(((at[s].n, at[s].x as usize), (at[e].n, at[e].x as usize + at[e].w as usize - 1)))
+    }
+
+    /// The whole line a cell is on, as a triple click takes it.
+    pub fn line_span(&self, n: u64) -> Span {
+        let (a, b) = self.logical(n);
+        ((a, 0), (b, self.cols - 1))
+    }
+
+    /// What to write to the program for a mouse event at column `x`, row `y` (of the
+    /// screen) with Shift, Alt and Ctrl as `mods`, when it asked for such events.
+    pub fn report(&self, ev: Mouse, x: usize, y: usize, mods: (bool, bool, bool)) -> Option<Vec<u8>> {
+        let wanted = match (self.mouse, ev) {
+            (Track::Off, _) => false,
+            (Track::Press, e) => matches!(e, Mouse::Press(_)),
+            (Track::Click, e) => !matches!(e, Mouse::Motion(_)),
+            (Track::Drag, Mouse::Motion(b)) => b.is_some(),
+            _ => true,
+        };
+        if !wanted {
+            return None;
+        }
+        let sgr = self.mouse_enc == Enc::Sgr;
+        let mut cb = match ev {
+            Mouse::Press(b) => b as u32,
+            Mouse::Release(b) if sgr => b as u32,
+            Mouse::Release(_) => 3,
+            Mouse::Motion(b) => 32 + b.map_or(3, |b| b as u32),
+            Mouse::Wheel(up) => if up { 64 } else { 65 },
+        };
+        // X10 compatibility mode tells only which button.
+        if self.mouse != Track::Press {
+            cb += 4 * mods.0 as u32 + 8 * mods.1 as u32 + 16 * mods.2 as u32;
+        }
+        let (x, y) = (x as u32 + 1, y as u32 + 1);
+        let mut out = b"\x1b[".to_vec();
+        match self.mouse_enc {
+            Enc::Sgr => out.extend_from_slice(format!("<{cb};{x};{y}{}", if matches!(ev, Mouse::Release(_)) { 'm' } else { 'M' }).as_bytes()),
+            Enc::Urxvt => out.extend_from_slice(format!("{};{x};{y}M", cb + 32).as_bytes()),
+            Enc::Utf8 => {
+                out.push(b'M');
+                for v in [cb + 32, x + 32, y + 32] {
+                    let mut b = [0; 4];
+                    out.extend_from_slice(char::from_u32(v.min(2047))?.encode_utf8(&mut b).as_bytes());
+                }
+            }
+            Enc::X10 => {
+                // One byte a number: past column 223 there is no way to say where.
+                if x > 223 || y > 223 {
+                    return None;
+                }
+                out.extend_from_slice(&[b'M', (cb + 32) as u8, (x + 32) as u8, (y + 32) as u8]);
+            }
+        }
+        Some(out)
+    }
+
     fn row(&mut self, y: usize) -> &mut Row {
         let i = self.lines.len() - self.rows + y;
         &mut self.lines[i]
@@ -258,6 +477,7 @@ impl Screen {
         row.cells.clear();
         row.cells.resize(self.cols, self.blank());
         row.wrapped = false;
+        row.links.clear();
         row
     }
 
@@ -325,7 +545,7 @@ impl Screen {
             return;
         }
         if on {
-            let blank: VecDeque<Row> = (0..self.rows).map(|_| Row { cells: vec![Cell::BLANK; self.cols], wrapped: false }).collect();
+            let blank: VecDeque<Row> = (0..self.rows).map(|_| Row::blank(self.cols)).collect();
             self.main = Some((std::mem::replace(&mut self.lines, blank), self.cur));
             self.scroll = 0;
         } else if let Some((lines, cur)) = self.main.take() {
@@ -344,6 +564,7 @@ impl Screen {
             return;
         }
         let (old_cols, old_rows) = (self.cols, self.rows);
+        self.changes += 1;
         let main = |lines: &mut VecDeque<Row>, cur: &mut Cursor| {
             if cols == old_cols {
                 fit(lines, old_rows, rows, cols, &mut cur.y, true);
@@ -376,6 +597,7 @@ impl Screen {
         let mut fresh = Screen::new(self.cols, self.rows);
         fresh.lines = std::mem::take(&mut self.lines);
         fresh.dropped = self.dropped;
+        fresh.changes = self.changes;
         fresh.replies = std::mem::take(&mut self.replies);
         *self = fresh;
         for y in 0..self.rows {
@@ -434,6 +656,27 @@ impl Screen {
                 (true, 25) => self.cursor_shown = on,
                 (true, 47 | 1047 | 1049) => self.set_alt(on),
                 (true, 2004) => self.bracketed_paste = on,
+                (true, m @ (9 | 1000 | 1002 | 1003)) => {
+                    self.mouse = match (on, m) {
+                        (false, _) => Track::Off,
+                        (_, 9) => Track::Press,
+                        (_, 1000) => Track::Click,
+                        (_, 1002) => Track::Drag,
+                        _ => Track::Motion,
+                    }
+                }
+                (true, m @ (1005 | 1006 | 1015)) => {
+                    let e = match m {
+                        1005 => Enc::Utf8,
+                        1006 => Enc::Sgr,
+                        _ => Enc::Urxvt,
+                    };
+                    if on {
+                        self.mouse_enc = e;
+                    } else if self.mouse_enc == e {
+                        self.mouse_enc = Enc::X10;
+                    }
+                }
                 (false, 4) => self.insert = on,
                 _ => {}
             }
@@ -488,10 +731,17 @@ fn rewrap(lines: &mut VecDeque<Row>, old_rows: usize, rows: usize, old_cols: usi
     }
     let old: Vec<Row> = lines.drain(..).collect();
     let (mut line, mut mark, mut pos) = (Vec::<Cell>::new(), None, (0, 0));
+    // The line's hyperlinks by where they are in it, cut again with its rows.
+    let mut links: Vec<(usize, usize, Arc<str>)> = vec![];
+    let cut = |links: &[(usize, usize, Arc<str>)], from: usize, to: usize| -> Vec<(u16, u16, Arc<str>)> {
+        links.iter().filter(|l| l.0 < to && l.1 > from).map(|l| ((l.0.max(from) - from) as u16, (l.1.min(to) - from) as u16, l.2.clone())).collect()
+    };
     for (i, row) in old.iter().enumerate() {
         if i == at {
             mark = Some(line.len() + cur.0);
         }
+        let base = line.len();
+        links.extend(row.links.iter().map(|l| (base + l.0 as usize, base + l.1 as usize, l.2.clone())));
         line.extend_from_slice(&row.cells);
         if row.wrapped && i + 1 < old.len() {
             // A row kept in the scrollback lost its trailing blanks, which were text.
@@ -505,12 +755,13 @@ fn rewrap(lines: &mut VecDeque<Row>, old_rows: usize, rows: usize, old_cols: usi
         while line.last().is_some_and(|c| c.empty()) {
             line.pop();
         }
-        let mut row = Vec::with_capacity(cols);
+        let (mut row, mut start) = (Vec::with_capacity(cols), 0);
         for (j, &c) in line.iter().enumerate() {
             let w = if c.flags() & WIDE != 0 { 2 } else { 1 };
             if row.len() + w > cols && c.flags() & SPACER == 0 {
                 row.resize(cols, Cell::BLANK);
-                lines.push_back(Row { cells: std::mem::replace(&mut row, Vec::with_capacity(cols)), wrapped: true });
+                lines.push_back(Row { cells: std::mem::replace(&mut row, Vec::with_capacity(cols)), wrapped: true, links: cut(&links, start, j) });
+                start = j;
             }
             if mark == Some(j) {
                 pos = (row.len(), lines.len());
@@ -521,8 +772,9 @@ fn rewrap(lines: &mut VecDeque<Row>, old_rows: usize, rows: usize, old_cols: usi
             pos = ((row.len() + m - line.len()).min(cols - 1), lines.len());
         }
         mark = None;
-        lines.push_back(Row { cells: row, wrapped: false });
+        lines.push_back(Row { cells: row, wrapped: false, links: cut(&links, start, line.len()) });
         line.clear();
+        links.clear();
     }
     // Text under the cursor stays on the screen with it, as much as fits.
     lines.truncate((pos.1 + rows).min(lines.len()));
@@ -597,11 +849,26 @@ impl Perform for Screen {
         if w == 2 {
             self.split_wide(y, x + 1);
         }
-        let style = pen.c & STYLE;
+        let style = pen.c & STYLE | if self.link.is_some() { LINK } else { 0 };
         let cells = &mut self.row(y).cells;
         cells[x] = Cell { c: c as u32 | style | if w == 2 { WIDE } else { 0 }, ..pen };
         if w == 2 {
             cells[x + 1] = Cell { c: ' ' as u32 | style | SPACER, ..pen };
+        }
+        if let Some(l) = self.link.clone() {
+            let (a, b) = (x as u16, (x + w) as u16);
+            let links = &mut self.row(y).links;
+            match links.last_mut() {
+                Some(last) if Arc::ptr_eq(&last.2, &l) && last.1 == a => last.1 = b,
+                _ => {
+                    // A link written over another cuts it back to what is left of it.
+                    for o in links.iter_mut().filter(|o| o.0 < b && o.1 > a) {
+                        o.1 = if o.0 < a { a } else { o.0 };
+                    }
+                    links.retain(|o| o.0 < o.1);
+                    links.push((a, b, l));
+                }
+            }
         }
         self.last = c;
         if x + w >= self.cols {
@@ -812,18 +1079,20 @@ impl Perform for Screen {
                 let t = rest.join(&b';');
                 self.title = String::from_utf8_lossy(&t).chars().filter(|c| !c.is_control()).take(200).collect();
             }
+            [b"8", _, uri @ ..] => {
+                let u = uri.join(&b';');
+                self.link = (!u.is_empty()).then(|| Arc::from(String::from_utf8_lossy(&u).as_ref()));
+            }
             [b"7", uri, ..] => {
                 // file://host/path, with %-escapes.
-                let s = String::from_utf8_lossy(uri);
-                let path = s.strip_prefix("file://").and_then(|r| r.find('/').map(|i| &r[i..]));
-                self.cwd = path.map(percent_decode);
+                self.cwd = crate::termlink::file_uri(&String::from_utf8_lossy(uri));
             }
             _ => {}
         }
     }
 }
 
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -856,5 +1125,6 @@ impl Term {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.screen, bytes);
+        self.screen.changes += 1;
     }
 }

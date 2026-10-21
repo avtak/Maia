@@ -47,6 +47,8 @@ pub struct GoToState {
     fwd: Vec<String>,
     /// Entry to highlight after the item list is rebuilt (after Back / Up).
     highlight: Option<PathBuf>,
+    /// Picking where Copy To… or Move To… sends the selection, not where to go.
+    pub dest: Option<crate::copyto::Dest>,
 }
 
 pub struct Capture {
@@ -209,8 +211,9 @@ pub enum Popup {
     Branches(BranchState),
     /// One stash: apply, pop, drop.
     Stash { panel: u64, root: PathBuf, stash: crate::gitwork::Stash, anchor: Pos2, sel: usize },
-    /// One local branch of the branch menu: switch, rename, delete.
-    Branch { root: PathBuf, branch: crate::gitwork::Branch, anchor: Pos2, sel: usize },
+    /// One branch of the branch menu: switch to it (or, a remote one, check it out),
+    /// compare it with the branch HEAD is on (`into`) or merge it in, rename, delete.
+    Branch { root: PathBuf, branch: crate::gitwork::Branch, anchor: Pos2, sel: usize, panel: u64, into: String, remote: bool },
     /// A commit in the history.
     GitCommit(CommitMenu),
     /// A new branch or tag at a commit.
@@ -220,8 +223,8 @@ pub enum Popup {
     DropMenu { paths: Vec<PathBuf>, dest: PathBuf, pos: Pos2 },
     Connect(ConnectState),
     ArchivePassword(PasswordState),
-    /// Compress With Password: the format and the password, typed twice.
-    Lock(LockState),
+    /// Compress: the archive's name, format, level, and a password if wanted.
+    Compress(CompressState),
     /// The passphrase of an encrypted drive being opened.
     Unlock(UnlockState),
     Meaning(MeaningState),
@@ -277,6 +280,9 @@ pub struct CommitMenu {
     pub pos: Pos2,
     /// The keyboard's item: none (`usize::MAX`) until the keys are used.
     pub sel: usize,
+    /// The commit marked to compare with, and the panel whose history it is in.
+    pub marked: Option<String>,
+    pub panel: u64,
 }
 
 /// Create branch here or Create tag here: a name, and for a tag a message that makes it
@@ -347,35 +353,79 @@ impl UnlockState {
     }
 }
 
-/// What Compress With Password asks before it packs.
-pub struct LockState {
+/// What Compress asks before it packs: the name (the format follows its extension, and
+/// the other way round), how hard to work, and a password for a zip or a 7z.
+pub struct CompressState {
     pub srcs: Vec<PathBuf>,
     pub dir: PathBuf,
-    /// 7-Zip rather than zip.
-    pub seven: bool,
+    pub name: String,
+    pub format: crate::archwrite::Format,
+    pub level: crate::archwrite::Level,
     pub password: String,
     pub again: String,
-    focus: bool,
+    /// The field to focus on the next frame: the name, or (Compress With Password) the
+    /// password.
+    focus: Option<bool>,
+    /// The name last looked for in the folder, and whether something has it.
+    taken: Option<(String, bool)>,
 }
 
-impl LockState {
-    pub fn new(srcs: Vec<PathBuf>, dir: PathBuf) -> LockState {
-        LockState { srcs, dir, seven: false, password: String::new(), again: String::new(), focus: true }
+impl CompressState {
+    pub fn new(srcs: Vec<PathBuf>, dir: PathBuf, format: crate::archwrite::Format, locked: bool) -> CompressState {
+        // One item is named after itself ("photo.png" -> "photo.zip"); several, "Archive".
+        let base = match srcs.as_slice() {
+            [one] => {
+                let n = one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if one.is_dir() { n } else { Path::new(&n).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(n) }
+            }
+            _ => "Archive".to_string(),
+        };
+        let name = fsx::unique_dest(&dir, &format!("{base}{}", format.ext())).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        CompressState { srcs, dir, name, format, level: crate::archwrite::last_level(), password: String::new(), again: String::new(), focus: Some(locked), taken: None }
     }
 
-    /// Why Compress can't run yet, if it can't.
-    pub fn problem(&self) -> Option<&'static str> {
-        if self.password.is_empty() {
-            Some("")
-        } else if self.password.contains(['\n', '\r']) {
-            Some("A password on one line")
-        } else if self.again.is_empty() {
-            Some("Type it again to be sure")
-        } else if self.again != self.password {
-            Some("The two passwords differ")
-        } else {
-            None
+    /// The name without the extension the format adds.
+    fn stem(&self) -> &str {
+        match crate::archwrite::Format::of(&self.name) {
+            Some(f) => &self.name[..self.name.len() - f.ext().len()],
+            None => self.name.trim_end_matches('.'),
         }
+    }
+
+    /// The file it makes: the name, with the format's extension when it lacks one.
+    pub fn out(&self) -> PathBuf {
+        let n = self.name.trim();
+        if crate::archwrite::Format::of(n) == Some(self.format) { self.dir.join(n) } else { self.dir.join(format!("{}{}", self.stem().trim(), self.format.ext())) }
+    }
+
+    /// Whether the format takes the password: zip always, 7z with the 7z command.
+    pub fn lockable(&self) -> bool {
+        self.format.lockable() && (self.format != crate::archwrite::Format::SevenZ || crate::archive::can_lock_7z())
+    }
+
+    /// Why Compress can't run yet, if it can't ("" when there is nothing to say).
+    pub fn problem(&self) -> Option<String> {
+        let n = self.name.trim();
+        if self.stem().trim().is_empty() || n.contains('/') {
+            return Some(String::new());
+        }
+        let names: Vec<String> = self.srcs.iter().filter_map(|s| s.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+        if let Some(d) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)).map(|x| x.1) {
+            return Some(format!("Two of these are called “{d}”"));
+        }
+        if self.taken.as_ref().is_some_and(|t| t.1) {
+            return Some(format!("There is a “{}” here already", self.out().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+        }
+        if !self.password.is_empty() && self.lockable() {
+            if self.password.contains(['\n', '\r']) {
+                return Some("A password on one line".into());
+            } else if self.again.is_empty() {
+                return Some(String::new());
+            } else if self.again != self.password {
+                return Some("The two passwords differ".into());
+            }
+        }
+        None
     }
 }
 
@@ -416,7 +466,7 @@ impl Popup {
             Popup::RunExec { .. } => "RunExec",
             Popup::Connect(..) => "Connect",
             Popup::ArchivePassword(..) => "ArchivePassword",
-            Popup::Lock(..) => "Lock",
+            Popup::Compress(..) => "Compress",
             Popup::Unlock(..) => "Unlock",
             Popup::Meaning(..) => "Meaning",
             Popup::Themes => "Themes",
@@ -461,7 +511,15 @@ impl Popup {
         }
     }
     pub fn goto(input: String) -> Popup {
-        Popup::GoTo(GoToState { input, last: None, sel: 0, items: vec![], focus: true, dir_cache: None, dir_job: None, snap_gen: 0, back: vec![], fwd: vec![], highlight: None })
+        Popup::GoTo(GoToState { input, last: None, sel: 0, items: vec![], focus: true, dir_cache: None, dir_job: None, snap_gen: 0, back: vec![], fwd: vec![], highlight: None, dest: None })
+    }
+    /// Go To picking a folder for Copy To… or Move To….
+    pub fn goto_dest(dest: crate::copyto::Dest) -> Popup {
+        let mut p = Popup::goto(String::new());
+        if let Popup::GoTo(st) = &mut p {
+            st.dest = Some(dest);
+        }
+        p
     }
     pub fn palette() -> Popup {
         Popup::Palette(PaletteState { query: String::new(), sel: 0, capture: None, conflict: None, focus: true, cat: None, scroll: false, top: true })
@@ -777,7 +835,7 @@ fn anchored<R>(ctx: &egui::Context, id: &str, pos: Pos2, width: f32, pal: &Palet
 
 /// `anchored`, with `pos` the menu's corner given by `pivot`: a menu opening upward
 /// from the status bar hangs from its lower edge, whatever its height.
-fn anchored_from<R>(ctx: &egui::Context, id: &str, pos: Pos2, pivot: Align2, width: f32, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> (R, Rect) {
+pub(crate) fn anchored_from<R>(ctx: &egui::Context, id: &str, pos: Pos2, pivot: Align2, width: f32, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> (R, Rect) {
     let screen = ctx.content_rect();
     let x = pos.x.min(screen.right() - width - 8.0).max(screen.left() + 4.0);
     // Kept off the window's edges, and scrolled when taller than the window (a Quick menu
@@ -849,7 +907,7 @@ pub(crate) fn hints(ui: &mut Ui, items: &[(&str, &str)], pal: &Palette) {
 }
 
 /// Full-width selectable row; returns its response. `paint` draws inside the rect.
-fn row(ui: &mut Ui, h: f32, selected: bool, pal: &Palette, paint: impl FnOnce(&Ui, Rect)) -> egui::Response {
+pub(crate) fn row(ui: &mut Ui, h: f32, selected: bool, pal: &Palette, paint: impl FnOnce(&Ui, Rect)) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
     if selected {
         ui.painter().rect_filled(r, CornerRadius::same(6), pal.selected);
@@ -985,7 +1043,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Popup::RunExec { path } => run_exec(app, ctx, path),
         Popup::Connect(st) => connect(app, ctx, st),
         Popup::ArchivePassword(st) => archive_password(app, ctx, st),
-        Popup::Lock(st) => lock(app, ctx, st),
+        Popup::Compress(st) => compress(app, ctx, st),
         Popup::Unlock(st) => unlock_drive(app, ctx, st),
         Popup::Meaning(st) => meaning(app, ctx, st),
         Popup::Themes => themes(app, ctx),
@@ -1025,7 +1083,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Popup::GitFile { panel, file, pos } => git_file_menu(app, ctx, *panel, *file, *pos),
         Popup::Branches(st) => branch_menu(app, ctx, st),
         Popup::Stash { panel, root, stash, anchor, sel } => stash_menu(app, ctx, *panel, root, stash, *anchor, sel),
-        Popup::Branch { root, branch, anchor, sel } => branch_actions(app, ctx, root, branch, *anchor, sel),
+        Popup::Branch { root, branch, anchor, sel, panel, into, remote } => branch_actions(app, ctx, root, branch, *anchor, sel, (*panel, into, *remote)),
         Popup::GitCommit(m) => commit_menu(app, ctx, m),
         Popup::NewRef(st) => new_ref(app, ctx, st),
         Popup::Notice { title, text } => notice(app, ctx, title, text),
@@ -1076,6 +1134,18 @@ fn goto_items(app: &App, st: &mut GoToState, known: &crate::sidebar::Known, ctx:
     let header = |items: &mut Vec<GoItem>, s: &str| items.push(GoItem { label: s.into(), sub: String::new(), path: PathBuf::new(), is_dir: false, header: true, usage: None });
     if input.trim().is_empty() {
         let collapsed = |g: &str| app.ud.collapsed_groups.iter().any(|x| x == &format!("goto:{g}"));
+        // Picking a destination: where things were sent last come first.
+        if st.dest.is_some() && !app.ud.destinations.is_empty() {
+            header(&mut items, "Recent destinations");
+            if !collapsed("Recent destinations") {
+                for p in &app.ud.destinations {
+                    push(&mut items, p);
+                    if let Some(it) = items.last_mut() {
+                        it.is_dir = true;
+                    }
+                }
+            }
+        }
         // Same groups, order and icons as the sidebar.
         let recents: Vec<PathBuf> = known.recents.iter().take(10).cloned().collect();
         if !recents.is_empty() {
@@ -1154,6 +1224,10 @@ fn goto_items(app: &App, st: &mut GoToState, known: &crate::sidebar::Known, ctx:
         if lp.is_empty() {
             scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| tab::natural_cmp(&a.1.to_lowercase(), &b.1.to_lowercase())));
         }
+        // A destination typed down to its folder ("~/Photos/") is that folder: first.
+        if st.dest.is_some() && input.ends_with('/') && st.dir_cache.as_ref().is_some_and(|(d, _)| *d == dir) {
+            items.push(GoItem { label: label_of(&dir), sub: dir.parent().map(|p| format!("› {}", p.display())).unwrap_or_default(), path: dir.clone(), is_dir: true, header: false, usage: None });
+        }
         for (_, n, d) in scored.into_iter().take(300) {
             let p = dir.join(n);
             items.push(GoItem { label: n.clone(), sub: format!("› {}", dir.display()), path: p, is_dir: d, header: false, usage: None });
@@ -1168,6 +1242,10 @@ fn goto_items(app: &App, st: &mut GoToState, known: &crate::sidebar::Known, ctx:
                 cands.push((p, bonus));
             }
         };
+        let dests: std::collections::HashSet<&PathBuf> = if st.dest.is_some() { app.ud.destinations.iter().collect() } else { Default::default() };
+        for (i, r) in app.ud.destinations.iter().enumerate().filter(|_| st.dest.is_some()) {
+            add(r.clone(), 60 - i as i32, &mut cands);
+        }
         for (i, r) in app.ud.recents.iter().enumerate() {
             add(r.clone(), 40 - (i as i32).min(40), &mut cands);
         }
@@ -1205,13 +1283,24 @@ fn goto_items(app: &App, st: &mut GoToState, known: &crate::sidebar::Known, ctx:
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         // Only folders known to exist (from the background snapshot or open tabs): no stat calls here.
-        for (_, p) in scored.into_iter().filter(|(_, p)| tab::is_computer(p) || known.dirs.contains(p) || tab_dirs.contains(p)).take(200) {
+        for (_, p) in scored.into_iter().filter(|(_, p)| tab::is_computer(p) || known.dirs.contains(p) || tab_dirs.contains(p) || dests.contains(p)).take(200) {
             push(&mut items, &p);
             // A folder seen only in an open tab is still a folder (it had a file's icon).
             if let Some(it) = items.last_mut() {
                 it.is_dir = true;
             }
         }
+    }
+    if st.dest.is_some() {
+        // Only folders take things; a group left empty goes too, unless it is folded.
+        items.retain(|it| it.header || (it.is_dir && crate::copyto::offered(&it.path)));
+        let folded = |it: &GoItem| app.ud.collapsed_groups.iter().any(|g| *g == format!("goto:{}", it.label));
+        let mut keep = vec![true; items.len()];
+        for i in 0..items.len() {
+            keep[i] = !items[i].header || folded(&items[i]) || items.get(i + 1).is_some_and(|n| !n.header);
+        }
+        let mut k = keep.into_iter();
+        items.retain(|_| k.next().unwrap_or(true));
     }
     st.items = items;
 }
@@ -1227,6 +1316,11 @@ fn goto(app: &mut App, ctx: &egui::Context, st: &mut GoToState) -> bool {
         }
     }
     let same_input = st.last.as_deref() == Some(st.input.as_str());
+    if !same_input {
+        if let Some(d) = &mut st.dest {
+            d.refused = None;
+        }
+    }
     if !same_input || landed || crate::sidebar::generation() != st.snap_gen {
         // Background data changed under an unchanged query: keep the highlighted row.
         let keep = same_input.then(|| st.items.get(st.sel).filter(|i| !i.header).map(|i| i.path.clone())).flatten();
@@ -1249,7 +1343,7 @@ fn goto(app: &mut App, ctx: &egui::Context, st: &mut GoToState) -> bool {
         return false;
     }
     // A network address connects (and opens) the place.
-    if (k.enter || k.ctrl_enter) && crate::network::is_uri(&st.input) {
+    if (k.enter || k.ctrl_enter) && st.dest.is_none() && crate::network::is_uri(&st.input) {
         let panel = app.active;
         app.connect(crate::network::normalize(&st.input), crate::network::Login { user: String::new(), password: String::new(), anonymous: false }, Some((panel, k.ctrl_enter)));
         return false;
@@ -1258,6 +1352,8 @@ fn goto(app: &mut App, ctx: &egui::Context, st: &mut GoToState) -> bool {
     if k.enter || k.ctrl_enter {
         match &cur {
             Some((p, d)) => go = Some((p.clone(), *d, k.ctrl_enter)),
+            // A destination typed in full is checked when it is used.
+            None if st.dest.is_some() => go = Some((fsx::expand_path(&st.input), true, false)),
             None => {
                 let p = fsx::expand_path(&st.input);
                 if p.exists() {
@@ -1283,12 +1379,21 @@ fn goto(app: &mut App, ctx: &egui::Context, st: &mut GoToState) -> bool {
         }
     }
     let (_, rect) = centered(ctx, "goto", 620.0, &pal, |ui| {
+        if let Some(d) = &st.dest {
+            dialog_title(ui, &d.title(), None, &pal);
+            ui.add_space(4.0);
+        }
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(20.0, 22.0), Sense::hover());
             let g = if !is_pathlike(&st.input) { Glyph::Search } else if fsx::mounts().iter().any(|m| m.path == fsx::expand_path(st.input.trim_end_matches('/'))) || st.input == "/" { Glyph::Drive } else { Glyph::Folder };
             paint_glyph(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(14.0)), g, pal.text_dim);
             let w = ui.available_width() - 4.0 * 28.0;
-            let resp = ui.add(egui::TextEdit::singleline(&mut st.input).hint_text(egui::RichText::new("Open or expand a folder…").color(pal.text_dim)).frame(false).desired_width(w).font(FontId::proportional(15.0)));
+            let hint = match &st.dest {
+                Some(d) if d.mv => "Folder to move into…",
+                Some(_) => "Folder to copy into…",
+                None => "Open or expand a folder…",
+            };
+            let resp = ui.add(egui::TextEdit::singleline(&mut st.input).hint_text(egui::RichText::new(hint).color(pal.text_dim)).frame(false).desired_width(w).font(FontId::proportional(15.0)));
             if st.focus {
                 resp.request_focus();
                 if let Some(mut s) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
@@ -1343,6 +1448,7 @@ fn goto(app: &mut App, ctx: &egui::Context, st: &mut GoToState) -> bool {
                     let hc = if resp.hovered() { pal.text } else { pal.text_dim };
                     let g = match it.label.as_str() {
                         "Recents" => Glyph::Clock,
+                        "Recent destinations" => Glyph::Forward,
                         "Bookmarks" => Glyph::Bookmark,
                         "Storage" => Glyph::Drive,
                         _ => Glyph::Folder,
@@ -1412,12 +1518,27 @@ fn goto(app: &mut App, ctx: &egui::Context, st: &mut GoToState) -> bool {
         if st.items.is_empty() {
             ui.label(egui::RichText::new(if is_pathlike(&st.input) { "No matching entries" } else { "No matches" }).color(pal.text_dim));
         }
-        if is_pathlike(&st.input) {
+        if let Some(d) = &st.dest {
+            if let Some(why) = &d.refused {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(why).color(pal.danger));
+            }
+            hints(ui, &[("↑↓", "navigate"), ("Enter", if d.mv { "move here" } else { "copy here" }), ("Tab", "expand"), ("Esc", "cancel")], &pal);
+        } else if is_pathlike(&st.input) {
             hints(ui, &[("↑↓", "navigate"), ("Enter", "use"), ("Tab", "expand"), ("Ctrl+Enter", "open in new tab"), ("Esc", "dismiss")], &pal);
         } else {
             hints(ui, &[("↑↓", "navigate"), ("Enter", "use"), ("Tab", "expand"), ("Esc", "dismiss")], &pal);
         }
     });
+    if let (Some((p, ..)), Some(d)) = (&go, &mut st.dest) {
+        match crate::copyto::send(app, d, p.clone()) {
+            Ok(()) => return false,
+            Err(why) => {
+                d.refused = Some(why);
+                go = None;
+            }
+        }
+    }
     if let Some((p, is_dir, new_tab)) = go {
         let id = app.active;
         if new_tab {
@@ -1445,16 +1566,19 @@ pub(crate) fn applicable(app: &App, c: Cmd) -> bool {
         Cmd::ClosePanel | Cmd::FocusNextPanel | Cmd::FocusPrevPanel | Cmd::CopyToOther | Cmd::MoveToOther => panels > 1,
         Cmd::InspectorLineNumbers | Cmd::InspectorWrap | Cmd::InspectorMinimap | Cmd::InspectorBlame | Cmd::InspectorFollow => p.inspector.is_some(),
         Cmd::InspectorSource => p.inspector.as_ref().is_some_and(|i| i.rich_kind().is_some()),
-        Cmd::GitHistory | Cmd::GitBranches | Cmd::GitChanges => crate::gitstatus::repo_for(&t.path).is_some(),
+        Cmd::GitHistory | Cmd::GitBranches | Cmd::GitChanges | Cmd::GitSearch => crate::gitstatus::repo_for(&t.path).is_some(),
         Cmd::OnlyChanged => t.only_changed || crate::gitstatus::repo_for(&t.path).is_some(),
         Cmd::ComparePanels | Cmd::SelectDifferences | Cmd::SyncPanels => panels > 1,
         Cmd::OpenLinkTarget => t.target_entries().first().map(|e| e.is_link).unwrap_or(false),
         Cmd::RestoreTrash => t.path.starts_with(crate::sidebar::trash_dir()),
         Cmd::Undo => !app.undo.is_empty(),
+        Cmd::Redo => app.undo.can_redo(),
         Cmd::ReopenTab => !app.closed_tabs.is_empty(),
         Cmd::EditTags => t.archive.is_none() && !t.path.starts_with(crate::sidebar::trash_dir()) && crate::musictags::applies(&t.target_entries().iter().map(|e| (e.ext(), e.is_dir)).collect::<Vec<_>>()),
         Cmd::CompressLocked => crate::archive::available() && t.archive.is_none() && !tab::is_computer(&t.path) && !t.targets_idx().is_empty(),
         Cmd::BatchRename => t.archive.is_none() && !tab::is_computer(&t.path) && !t.targets_idx().is_empty(),
+        Cmd::CopyTo => !tab::is_computer(&t.path) && !t.targets_idx().is_empty(),
+        Cmd::MoveTo => !tab::is_computer(&t.path) && t.archive.is_none() && !t.targets_idx().is_empty(),
         Cmd::Rename | Cmd::Copy | Cmd::Cut | Cmd::Trash | Cmd::DeletePermanent | Cmd::Duplicate | Cmd::CreateLink => !t.targets_idx().is_empty(),
         Cmd::LoadLayout | Cmd::DeleteLayout => !app.ud.layouts.is_empty(),
         Cmd::SortFullAsc | Cmd::SortFullDesc => tab::is_computer(&t.path) && !(t.settings.sort == crate::config::SortKey::Usage && t.settings.desc == (c == Cmd::SortFullDesc)),
@@ -1491,6 +1615,9 @@ pub(crate) fn applicable(app: &App, c: Cmd) -> bool {
         Cmd::GroupDeleted | Cmd::GroupOriginal => crate::trashcan::is_trash_files(&t.path),
         Cmd::GroupFree | Cmd::GroupFs | Cmd::GroupFull => tab::is_computer(&t.path),
         Cmd::GroupItems | Cmd::GroupUsage | Cmd::GroupName | Cmd::GroupType | Cmd::GroupDate | Cmd::GroupCreated | Cmd::GroupAccessed | Cmd::GroupSize => !tab::is_computer(&t.path) && !t.tree_active(),
+        Cmd::GroupTag => !tab::is_computer(&t.path) && !t.tree_active(),
+        Cmd::SortTags | Cmd::SortTaken | Cmd::SortDimensions | Cmd::SortDuration => !tab::is_computer(&t.path),
+        Cmd::GroupTaken => !tab::is_computer(&t.path) && !t.tree_active(),
         Cmd::GroupExpandAll => t.settings.group != crate::config::GroupBy::None && !t.collapsed_groups.is_empty(),
         Cmd::GroupCollapseAll => t.settings.group != crate::config::GroupBy::None,
         _ => true,
@@ -2165,6 +2292,7 @@ pub(crate) enum Opt {
     IgnoredFiles,
     TrashAge,
     DefaultFm,
+    Picker,
     SingleInstance,
     Meaning,
     MeaningFolders,
@@ -2176,6 +2304,7 @@ pub(crate) enum Opt {
     Editor,
     Tour,
     CustomActions,
+    CheckCopies,
 }
 
 /// The pages of Options, in the order of its left column.
@@ -2286,6 +2415,7 @@ pub(crate) const OPTS: &[(Opt, Section, &str, &str, &str)] = &[
     (Opt::TrackRecents, Section::Files, "Recents", "Remember recents", "Visited folders and opened files."),
     (Opt::HighlightRecents, Section::Files, "Recents", "Highlight recents", "Mark recently used items with a dot."),
     (Opt::RecentsOnTop, Section::Files, "Recents", "Recents on top", "Sort recently used items first."),
+    (Opt::CheckCopies, Section::Files, "Copies", "Check copies", "Read each copy back from the disk and compare it."),
     (Opt::TrashAge, Section::Files, "Trash", "Empty the trash", "What stays longer goes for good. Off unless you choose."),
     (Opt::CustomActions, Section::Files, "Right-click menu", "Custom actions", "Your own commands for the files you right-click."),
     (Opt::SingleClick, Section::Mouse, "Clicks", "Single click to open", "Open items with one click."),
@@ -2311,6 +2441,7 @@ pub(crate) const OPTS: &[(Opt, Section, &str, &str, &str)] = &[
     (Opt::Startup, Section::System, "Startup", "On startup", "What Maia shows when it starts."),
     (Opt::NewTab, Section::System, "Startup", "New tab shows", "The folder a new tab opens."),
     (Opt::DefaultFm, Section::System, "System", "Default file manager", "Open folders from other apps in Maia."),
+    (Opt::Picker, Section::System, "System", "Open and save dialog", "Pick files for other apps in Maia."),
     (Opt::SingleInstance, Section::System, "System", "Reuse the open window", "Other apps and new launches open tabs here."),
     (Opt::AssetCache, Section::System, "System", "Asset cache size", "Memory for thumbnails and previews."),
     (Opt::Editor, Section::System, "Developer", "Editor", "Empty finds one; a command can use {file} and {line}."),
@@ -2521,7 +2652,7 @@ fn opt_default(c: &mut crate::config::Config, o: Opt, reset: bool) -> bool {
     match o {
         Opt::Theme => f!(theme),
         // Lives in the desktop's settings, not Maia's: nothing to reset.
-        Opt::DefaultFm => true,
+        Opt::DefaultFm | Opt::Picker => true,
         // Buttons, not settings.
         Opt::ConfigFile | Opt::ResetAll | Opt::Install | Opt::Updates | Opt::Tour | Opt::CustomActions => true,
         Opt::SingleInstance => f!(single_instance),
@@ -2560,6 +2691,7 @@ fn opt_default(c: &mut crate::config::Config, o: Opt, reset: bool) -> bool {
         Opt::InspectorFont => f!(inspector_font),
         Opt::Thumbnails => f!(thumbnails),
         Opt::ThumbFill => f!(thumb_fill),
+        Opt::CheckCopies => f!(check_copies),
         Opt::ScrollBeyond => f!(scroll_beyond),
         Opt::DateFormat => f!(date_format),
         Opt::ActOnPress => f!(act_on_press),
@@ -2593,6 +2725,13 @@ fn option_control_inner(ui: &mut Ui, app: &mut App, o: Opt, pal: &Palette, layou
         let mut on = app.default_fm() == Some(true);
         if toggle(ui, &mut on, &pal) {
             app.set_default_fm(on);
+        }
+        return false;
+    }
+    if o == Opt::Picker {
+        let mut on = app.picker_setting() == Some(true);
+        if toggle(ui, &mut on, &pal) {
+            app.set_picker_setting(on);
         }
         return false;
     }
@@ -2664,7 +2803,7 @@ fn option_control_inner(ui: &mut Ui, app: &mut App, o: Opt, pal: &Palette, layou
         }
         Opt::IgnoredFiles => choice(ui, "ignored", &mut c.git_ignored, &[(IgnoredFiles::Dim, "Dim"), (IgnoredFiles::Hide, "Hide"), (IgnoredFiles::Show, "Show")]),
         Opt::MeaningFolders => ui.add(egui::TextEdit::singleline(&mut c.semantic_folders).hint_text(egui::RichText::new("~/Documents").color(pal.text_dim)).desired_width(150.0).margin(egui::Margin::symmetric(5, 2))).lost_focus(),
-        Opt::DefaultFm => false,
+        Opt::DefaultFm | Opt::Picker => false,
         Opt::Updates => {
             update_control(ui, app, &pal);
             false
@@ -2709,6 +2848,7 @@ fn option_control_inner(ui: &mut Ui, app: &mut App, o: Opt, pal: &Palette, layou
         }
         Opt::Thumbnails => choice(ui, "thumbs", &mut c.thumbnails, &[(ThumbMode::LocalDisks, "Local disks"), (ThumbMode::AllDrives, "All drives"), (ThumbMode::Never, "Never")]),
         Opt::ThumbFill => toggle(ui, &mut c.thumb_fill, &pal),
+        Opt::CheckCopies => toggle(ui, &mut c.check_copies, &pal),
         Opt::ScrollBeyond => toggle(ui, &mut c.scroll_beyond, &pal),
         Opt::DateFormat => ui.add(egui::TextEdit::singleline(&mut c.date_format).desired_width(150.0).margin(egui::Margin::symmetric(5, 2))).changed(),
         Opt::ActOnPress => toggle(ui, &mut c.act_on_press, &pal),
@@ -2752,6 +2892,8 @@ fn option_row(ui: &mut Ui, app: &mut App, oi: usize, r: Rect, look: &RowLook, q:
     let (o, sec, _, title, desc) = OPTS[oi];
     // Without curl there is no way to ask: said in place of what it would do.
     let desc: &str = if o == Opt::GitPictures && app.avatars.curl() == Some(false) { "Needs curl, which isn't installed; authors keep their initials." } else { desc };
+    // What keeps the portal from reaching Maia here, in place of what it would do.
+    let desc: &str = if o == Opt::Picker { app.picker_missing().unwrap_or(desc) } else { desc };
     // Sub-options sit indented under their switch and fade while it is off.
     let indent = if opt_parent(o).is_some() && !look.label { 20.0 } else { 0.0 };
     let inert = !parent_on(&app.cfg, o);
@@ -2959,6 +3101,10 @@ fn options(app: &mut App, ctx: &egui::Context, st: &mut OptState) -> bool {
                     Opt::DefaultFm => {
                         let on = app.default_fm() == Some(true);
                         app.set_default_fm(!on);
+                    }
+                    Opt::Picker => {
+                        let on = app.picker_setting() == Some(true);
+                        app.set_picker_setting(!on);
                     }
                     Opt::Theme => app.popup = Popup::Themes,
                     Opt::ConfigFile => cmd = Some(Cmd::OpenConfig),
@@ -3389,9 +3535,12 @@ fn zoom(app: &mut App, ctx: &egui::Context, panel: u64, anchor: Pos2) -> bool {
         return false;
     }
     // Opens above the footer chip. The named views sit beside a vertical slider, each
-    // at the height of its zoom value, so the dense views bunch up at the bottom.
+    // at the height of its zoom value, so the dense views bunch up at the bottom; Columns,
+    // which has no zoom, below them. It hangs from its lower edge, whatever the Spacing.
     let (w, track) = (176.0, 168.0);
-    let (_, rect) = anchored(ctx, "zoom", pos2(anchor.x - w + 30.0, anchor.y - track - 40.0), w, &pal, |ui| {
+    let columns = t.settings.column_view;
+    let mut set_columns = false;
+    let (_, rect) = anchored_from(ctx, "zoom", pos2(anchor.x - w + 30.0, anchor.y - 10.0), Align2::LEFT_BOTTOM, w, &pal, |ui| {
         let (r, resp) = ui.allocate_exact_size(vec2(w - 16.0, track + 20.0), Sense::click_and_drag());
         let rail_x = r.right() - 10.0;
         let (y0, y1) = (r.bottom() - 10.0, r.top() + 10.0);
@@ -3402,7 +3551,7 @@ fn zoom(app: &mut App, ctx: &egui::Context, panel: u64, anchor: Pos2) -> bool {
         for (name, v) in crate::listing::VIEW_STOPS {
             let y = y_of(v);
             let lr = Rect::from_min_max(pos2(r.left(), y - 10.0), pos2(rail_x - 14.0, y + 10.0));
-            let on = crate::listing::view_name(z) == name || (name == "M Icons" && (z - 0.3).abs() < 0.001);
+            let on = !columns && (crate::listing::view_name(z) == name || (name == "M Icons" && (z - 0.3).abs() < 0.001));
             let hov = ui.rect_contains_pointer(lr);
             if on {
                 painter.rect_filled(lr, CornerRadius::same(4), pal.accent);
@@ -3422,7 +3571,7 @@ fn zoom(app: &mut App, ctx: &egui::Context, panel: u64, anchor: Pos2) -> bool {
         // Slider rail and knob.
         painter.line_segment([pos2(rail_x, y0), pos2(rail_x, y1)], Stroke::new(4.0, pal.border));
         painter.line_segment([pos2(rail_x, y0), pos2(rail_x, y_of(z))], Stroke::new(4.0, pal.accent.gamma_multiply(0.6)));
-        painter.circle_filled(pos2(rail_x, y_of(z)), 7.0, pal.accent);
+        painter.circle_filled(pos2(rail_x, y_of(z)), 7.0, if columns { pal.text_dim } else { pal.accent });
         if let Some(pp) = resp.interact_pointer_pos() {
             if resp.dragged() || (resp.clicked() && pp.x > rail_x - 16.0) {
                 let v = ((pp.y - y0) / (y1 - y0)).clamp(0.0, 1.0);
@@ -3430,11 +3579,30 @@ fn zoom(app: &mut App, ctx: &egui::Context, panel: u64, anchor: Pos2) -> bool {
                 set = Some(if v < 0.3 { (v * 10.0).round() / 10.0 } else { v });
             }
         }
+        let (sep, _) = ui.allocate_exact_size(vec2(w - 16.0, 3.0), Sense::hover());
+        ui.painter().line_segment([pos2(sep.left() + 4.0, sep.center().y), pos2(sep.right() - 4.0, sep.center().y)], Stroke::new(1.0, pal.border));
+        let (cr, cresp) = ui.allocate_exact_size(vec2(w - 16.0, 20.0), Sense::click());
+        let lr = Rect::from_min_max(cr.min, pos2(rail_x - 14.0, cr.bottom()));
+        if columns {
+            ui.painter().rect_filled(lr, CornerRadius::same(4), pal.accent);
+        } else if cresp.hovered() {
+            ui.painter().rect_filled(lr, CornerRadius::same(4), pal.hover);
+        }
+        let col = if columns { Color32::WHITE } else { pal.text };
+        crate::listing::paint_view_glyph(ui.painter(), Rect::from_center_size(pos2(lr.left() + 12.0, lr.center().y), Vec2::splat(11.0)), crate::listing::Mode::Columns, col);
+        ui.painter().text(pos2(lr.left() + 26.0, lr.center().y), Align2::LEFT_CENTER, "Columns", FontId::proportional(12.5), col);
+        set_columns = cresp.clicked();
         if let Some(v) = set {
             t.settings.zoom = v;
+            t.dirty |= std::mem::take(&mut t.settings.column_view);
             t.scroll_to_cursor = true;
         }
     });
+    if set_columns {
+        t.settings.column_view = true;
+        t.dirty = true;
+        t.scroll_to_cursor = true;
+    }
     !clicked_outside(ctx, rect)
 }
 
@@ -3688,76 +3856,123 @@ fn unlock_drive(app: &mut App, ctx: &egui::Context, st: &mut UnlockState) -> boo
     !cancel
 }
 
-/// Compress With Password: zip or 7z, the password twice (hidden as typed), then the
-/// usual compress job with the password handed to it.
-fn lock(app: &mut App, ctx: &egui::Context, st: &mut LockState) -> bool {
+/// Compress: the name (prefilled, as the menu used to name it), the format and the
+/// level as chips, and a password, typed twice, for a zip or a 7z. Enter compresses.
+fn compress(app: &mut App, ctx: &egui::Context, st: &mut CompressState) -> bool {
+    use crate::archwrite::{Format, Level};
     let pal = app.pal;
     if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
         return false;
     }
-    let ok = st.problem().is_none();
+    // Looked for once per name typed, not on every frame.
+    let out = st.out();
+    if st.taken.as_ref().is_none_or(|t| t.0 != st.name) {
+        st.taken = Some((st.name.clone(), std::fs::symlink_metadata(&out).is_ok()));
+    }
+    let problem = st.problem();
     // Taken either way: Enter with the passwords not yet agreeing leaves the cursor where
     // it was rather than send it out of the field.
-    let mut go = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) && ok;
+    let mut go = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) && problem.is_none();
     let mut cancel = false;
-    let seven_ok = crate::archive::can_lock_7z();
-    let n = st.srcs.len();
     let what = match st.srcs.as_slice() {
         [one] => format!("“{}”", one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
-        _ => format!("{n} items"),
+        v => format!("{} items", v.len()),
     };
-    centered(ctx, "lock archive", 420.0, &pal, |ui| {
-        dialog_title(ui, &format!("Compress {what} with a password"), None, &pal);
+    let lockable = st.lockable();
+    centered(ctx, "compress", 420.0, &pal, |ui| {
+        dialog_title(ui, &format!("Compress {what}"), None, &pal);
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if crate::devtools::chip(ui, "Zip", !st.seven, "lock zip", "A .zip locked with AES-256; the names inside stay readable", &pal, false) {
-                st.seven = false;
+        ui.label(egui::RichText::new("Name").small().color(pal.text_dim));
+        let r = ui.add(egui::TextEdit::singleline(&mut st.name).desired_width(f32::INFINITY));
+        crate::ui::note_control(ui, r.rect, "compress name");
+        if st.focus == Some(false) {
+            r.request_focus();
+            st.focus = None;
+        }
+        // An extension typed picks the format.
+        if r.changed() {
+            if let Some(f) = Format::of(&st.name) {
+                st.format = f;
             }
-            if seven_ok && crate::devtools::chip(ui, "7-Zip", st.seven, "lock 7z", "A .7z whose names are locked too", &pal, false) {
-                st.seven = true;
+        }
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for f in Format::ALL {
+                let what = match f {
+                    Format::Zip => "compress zip",
+                    Format::TarGz => "compress tar.gz",
+                    Format::TarXz => "compress tar.xz",
+                    Format::SevenZ => "compress 7z",
+                };
+                let tip = match f {
+                    Format::Zip => "Opens anywhere; a password locks it with AES-256",
+                    Format::TarGz => "Keeps Linux permissions and links; quick",
+                    Format::TarXz => "Keeps Linux permissions and links; smaller, slower",
+                    Format::SevenZ => "Small; a password locks the names too",
+                };
+                if crate::devtools::chip(ui, f.label(), st.format == f, what, tip, &pal, false) && st.format != f {
+                    st.name = format!("{}{}", st.stem(), f.ext());
+                    st.format = f;
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for l in Level::ALL {
+                let (what, tip) = match l {
+                    Level::Fast => ("compress fast", "Quickest, a bigger archive"),
+                    Level::Normal => ("compress normal", "The tools' usual balance"),
+                    Level::Smallest => ("compress smallest", "Slowest, the smallest archive"),
+                };
+                if crate::devtools::chip(ui, l.label(), st.level == l, what, tip, &pal, false) {
+                    st.level = l;
+                }
             }
         });
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Password").small().color(pal.text_dim));
-        let r = ui.add(egui::TextEdit::singleline(&mut st.password).password(true).desired_width(f32::INFINITY));
-        crate::ui::note_control(ui, r.rect, "lock password");
-        if st.focus {
+        let hint = if lockable {
+            "None"
+        } else if st.format.lockable() {
+            "A locked 7z needs the 7z command"
+        } else {
+            "Only zip and 7-Zip take one"
+        };
+        let r = ui.add_enabled(lockable, egui::TextEdit::singleline(&mut st.password).password(true).hint_text(hint).desired_width(f32::INFINITY));
+        crate::ui::note_control(ui, r.rect, "compress password");
+        if st.focus == Some(true) {
             r.request_focus();
-            st.focus = false;
+            st.focus = None;
         }
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("Again").small().color(pal.text_dim));
-        let r = ui.add(egui::TextEdit::singleline(&mut st.again).password(true).desired_width(f32::INFINITY));
-        crate::ui::note_control(ui, r.rect, "lock again");
-        match st.problem() {
-            Some(why) if !why.is_empty() && !st.again.is_empty() => {
+        if lockable && !st.password.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Again").small().color(pal.text_dim));
+            let r = ui.add(egui::TextEdit::singleline(&mut st.again).password(true).desired_width(f32::INFINITY));
+            crate::ui::note_control(ui, r.rect, "compress again");
+        }
+        match &problem {
+            // The passwords are said to differ only once the second is being typed.
+            Some(why) if !why.is_empty() && (!why.contains("passwords") || !st.again.is_empty()) => {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(why).small().color(pal.danger));
+                ui.label(egui::RichText::new(why.as_str()).small().color(pal.danger));
             }
             _ => {}
         }
         dialog_buttons(ui, |ui| {
-            let b = primary_button(ui, "Compress", ok, &pal);
-            crate::ui::note_control(ui, b.rect, "lock compress");
-            go |= b.clicked() && ok;
+            let b = primary_button(ui, "Compress", problem.is_none(), &pal);
+            crate::ui::note_control(ui, b.rect, "compress button");
+            go |= b.clicked() && problem.is_none();
             if plain_button(ui, "Cancel", &pal).clicked() {
                 cancel = true;
             }
         });
     });
     if go {
-        let ext = if st.seven && seven_ok { "7z" } else { "zip" };
-        let base = match st.srcs.as_slice() {
-            [one] => {
-                let n = one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                if one.is_dir() { n } else { Path::new(&n).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(n) }
-            }
-            _ => "Archive".to_string(),
-        };
-        let out = fsx::unique_dest(&st.dir, &format!("{base}.{ext}"));
-        let password = Some(crate::archive::Secret(std::mem::take(&mut st.password)));
+        *crate::archwrite::LAST_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = st.level;
+        let password = (st.lockable() && !st.password.is_empty()).then(|| crate::archive::Secret(std::mem::take(&mut st.password)));
         st.again.clear();
-        app.actions.push(Action::StartJob(crate::ops::OpKind::Compress { srcs: std::mem::take(&mut st.srcs), out, password }));
+        let out = st.out();
+        app.actions.push(Action::StartJob(crate::ops::OpKind::Compress { srcs: std::mem::take(&mut st.srcs), out, password, level: st.level }));
         return false;
     }
     !cancel
@@ -5975,8 +6190,8 @@ fn paint_counts(p: &egui::Painter, right: f32, cy: f32, ahead: u32, behind: u32,
 /// The branch chip's menu: the history first, then the branches (the current one
 /// marked, each with what it has to push and pull), a new branch, the remote branches
 /// nothing tracks yet, the stashes and the other work trees. Up, Down and Enter work it;
-/// a branch has its own menu on a right click, and F2 and Delete rename and delete the
-/// selected one.
+/// a branch, local or remote, has its own menu on a right click or Shift+F10, and F2 and
+/// Delete rename and delete the selected one.
 fn branch_menu(app: &mut App, ctx: &egui::Context, st: &mut BranchState) -> bool {
     let pal = app.pal;
     let k = take_keys(ctx);
@@ -6022,7 +6237,9 @@ fn branch_menu(app: &mut App, ctx: &egui::Context, st: &mut BranchState) -> bool
             return false;
         }
     }
+    // A branch's own menu: on a right click, or Shift+F10 on the one the keys are on.
     let mut actions = None;
+    let menu_key = st.keyed && ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F10));
     // Opens upward from the chip, hanging from its lower edge.
     let w = 300.0;
     let pos = pos2(st.anchor.right() - w + 8.0, st.anchor.top() - 4.0);
@@ -6095,8 +6312,13 @@ fn branch_menu(app: &mut App, ctx: &egui::Context, st: &mut BranchState) -> bool
             if resp.clicked() {
                 pick = Some(*it);
             }
-            if let (true, BranchItem::Branch(b), Some(r)) = (resp.secondary_clicked(), *it, &refs) {
-                actions = Some((r.local[b].clone(), ctx.pointer_interact_pos().unwrap_or(resp.rect.center())));
+            let at = || if menu_key { pos2(resp.rect.left() + 40.0, resp.rect.bottom()) } else { ctx.pointer_interact_pos().unwrap_or(resp.rect.center()) };
+            if resp.secondary_clicked() || menu_key && sel {
+                match (*it, &refs) {
+                    (BranchItem::Branch(b), Some(r)) => actions = Some((r.local[b].clone(), at(), false)),
+                    (BranchItem::Remote(k), Some(r)) => actions = Some((crate::gitwork::Branch { name: r.remote[k].clone(), ..Default::default() }, at(), true)),
+                    _ => {}
+                }
             }
         }
         if refs.is_none() {
@@ -6107,8 +6329,9 @@ fn branch_menu(app: &mut App, ctx: &egui::Context, st: &mut BranchState) -> bool
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
     });
-    if let Some((branch, anchor)) = actions {
-        app.popup = Popup::Branch { root: st.root.clone(), branch, anchor, sel: usize::MAX };
+    if let Some((branch, anchor, remote)) = actions {
+        let into = st.refs.as_ref().and_then(|r| r.local.iter().find(|b| b.current)).map_or_else(|| "HEAD".to_string(), |b| b.name.clone());
+        app.popup = Popup::Branch { root: st.root.clone(), branch, anchor, sel: if menu_key { 0 } else { usize::MAX }, panel: st.panel, into, remote };
         return false;
     }
     let Some(it) = pick else { return !clicked_outside(ctx, rect) };
@@ -6240,43 +6463,99 @@ fn delete_branch(app: &mut App, root: &Path, name: String) {
     crate::gitwork::start(&app.ctx, root, crate::gitwork::Op::DeleteBranch { name: name.clone(), force: false }, format!("Couldn't delete {name}"));
 }
 
-/// One local branch's menu (the branch menu's right click): switch to it, rename it,
-/// delete it. The branch HEAD is on can only be renamed.
-fn branch_actions(app: &mut App, ctx: &egui::Context, root: &Path, b: &crate::gitwork::Branch, anchor: Pos2, sel: &mut usize) -> bool {
+/// The history of panel `panel`, opened in its inspector if it isn't yet.
+fn history_in(app: &mut App, panel: u64) -> Option<&mut crate::gitlog::History> {
+    let p = app.panels.get_mut(&panel)?;
+    if p.inspector.as_ref().and_then(|i| i.git.as_ref()).is_none() {
+        let r = crate::gitstatus::repo_for(&p.path())?;
+        let opened = p.inspector.is_none();
+        p.inspector.get_or_insert_with(crate::inspector::Inspector::default).show_history(crate::gitlog::History::new(r.root.clone(), r.branch.clone(), opened));
+    }
+    p.inspector.as_mut()?.git.as_deref_mut()
+}
+
+/// One branch's menu (the branch menu's right click, or Shift+F10): switch to it or, a
+/// remote one, check it out; compare it with the branch HEAD is on, or merge it in;
+/// rename it, delete it. The branch HEAD is on can only be renamed.
+fn branch_actions(app: &mut App, ctx: &egui::Context, root: &Path, b: &crate::gitwork::Branch, anchor: Pos2, sel: &mut usize, (panel, into, remote): (u64, &str, bool)) -> bool {
     let pal = app.pal;
     let k = take_keys(ctx);
     if k.esc {
         return false;
     }
-    let items: &[&str] = if b.current { &["Rename…"] } else { &["Switch to it", "Rename…", "Delete"] };
+    #[derive(Clone, Copy, PartialEq)]
+    enum It {
+        Switch,
+        Track,
+        Compare,
+        Merge,
+        Rename,
+        Delete,
+    }
+    let items: &[It] = match (remote, b.current) {
+        (true, _) => &[It::Track, It::Compare, It::Merge],
+        (false, true) => &[It::Rename],
+        (false, false) => &[It::Switch, It::Compare, It::Merge, It::Rename, It::Delete],
+    };
     if *sel == usize::MAX && (k.up || k.down) {
         *sel = 0;
     } else if *sel != usize::MAX {
         step(sel, items.len(), &k, |_| false);
     }
     let mut pick = if k.enter && *sel < items.len() { Some(items[*sel]) } else { None };
-    let (_, rect) = anchored(ctx, "branchactions", anchor, 240.0, &pal, |ui| {
-        let sub = if b.upstream.is_empty() { "Not published".to_string() } else { format!("Tracks {}", b.upstream) };
+    let (_, rect) = anchored(ctx, "branchactions", anchor, 260.0, &pal, |ui| {
+        let sub = match (remote, b.upstream.is_empty()) {
+            (true, _) => "Remote branch".to_string(),
+            (false, true) => "Not published".to_string(),
+            (false, false) => format!("Tracks {}", b.upstream),
+        };
         menu_title(ui, &b.name, &sub, &pal);
-        for (i, label) in items.iter().enumerate() {
-            if key_item(ui, label, i == *sel, true, &pal).clicked() {
-                pick = Some(label);
+        for (i, &it) in items.iter().enumerate() {
+            if i > 0 && matches!(it, It::Compare | It::Rename) {
+                menu_sep(ui, &pal);
+            }
+            let label = match it {
+                It::Switch => "Switch to it".into(),
+                It::Track => "Check out".into(),
+                It::Compare => format!("Compare with {into}"),
+                It::Merge => format!("Merge into {into}"),
+                It::Rename => "Rename…".into(),
+                It::Delete => "Delete".into(),
+            };
+            let resp = key_item(ui, &label, i == *sel, true, &pal);
+            let resp = match it {
+                It::Track => resp.on_hover_text("A local branch of it, tracking it"),
+                It::Compare => resp.on_hover_text(format!("The commits each has that the other doesn't, and what {} changes since they split", b.name)),
+                It::Merge => resp.on_hover_text("A fast-forward when it can be, else a merge commit. Reset to the commit it was at takes it back."),
+                _ => resp,
+            };
+            if resp.clicked() {
+                pick = Some(it);
             }
         }
     });
-    let Some(label) = pick else { return !clicked_outside(ctx, rect) };
+    let Some(it) = pick else { return !clicked_outside(ctx, rect) };
     let name = b.name.clone();
-    match label {
-        "Switch to it" => crate::gitwork::start(&app.ctx, root, crate::gitwork::Op::Switch(name.clone()), format!("Couldn't switch to {name}")),
-        "Rename…" => rename_branch(app, root, name),
-        _ => delete_branch(app, root, name),
+    match it {
+        It::Switch => crate::gitwork::start(&app.ctx, root, crate::gitwork::Op::Switch(name.clone()), format!("Couldn't switch to {name}")),
+        It::Track => crate::gitwork::start(&app.ctx, root, crate::gitwork::Op::Track(name.clone()), format!("Couldn't check out {name}")),
+        It::Compare => {
+            app.actions.push(Action::FocusPanel(panel));
+            if let Some(h) = history_in(app, panel) {
+                h.compare([into.to_string(), name.clone()], ["HEAD".into(), name], false);
+            }
+        }
+        It::Merge => crate::gitwork::start(&app.ctx, root, crate::gitwork::Op::Merge(name.clone()), format!("Couldn't merge {name}")),
+        It::Rename => rename_branch(app, root, name),
+        It::Delete => delete_branch(app, root, name),
     }
     false
 }
 
 /// A commit's menu in the history: check it out, branch or tag it, cherry-pick or
-/// revert it, reset the current branch to it (asking how), delete its tags, copy its
-/// hash. Up, Down and Enter work it.
+/// revert it, reset the current branch to it (asking how), mark it to compare with or
+/// compare it with the one marked, delete its tags, copy its hash. Up, Down and Enter
+/// work it.
 fn commit_menu(app: &mut App, ctx: &egui::Context, m: &mut CommitMenu) -> bool {
     use crate::gitwork::Op;
     let pal = app.pal;
@@ -6292,10 +6571,16 @@ fn commit_menu(app: &mut App, ctx: &egui::Context, m: &mut CommitMenu) -> bool {
         Pick,
         Revert,
         Reset,
+        Compare,
+        Mark,
         Untag(usize),
         Copy,
     }
     let mut items = vec![It::Checkout, It::Branch, It::Tag, It::Pick, It::Revert, It::Reset];
+    // Comparing: one commit marked, then another's menu compares with it.
+    let other = m.marked.clone().filter(|x| *x != m.hash);
+    items.extend(other.is_some().then_some(It::Compare));
+    items.push(It::Mark);
     items.extend((0..m.tags.len()).map(It::Untag));
     items.push(It::Copy);
     // HEAD's own commit has nothing to check out, pick or reset to.
@@ -6312,7 +6597,7 @@ fn commit_menu(app: &mut App, ctx: &egui::Context, m: &mut CommitMenu) -> bool {
     let (_, rect) = anchored(ctx, "commitmenu", m.pos, 270.0, &pal, |ui| {
         menu_title(ui, short, &m.subject, &pal);
         for (i, &it) in items.iter().enumerate() {
-            if it == It::Pick || it == It::Untag(0) || it == It::Copy && m.tags.is_empty() {
+            if it == It::Pick || it == It::Untag(0) || it == It::Copy && m.tags.is_empty() || it == It::Compare || it == It::Mark && other.is_none() {
                 menu_sep(ui, &pal);
             }
             let label = match it {
@@ -6322,6 +6607,9 @@ fn commit_menu(app: &mut App, ctx: &egui::Context, m: &mut CommitMenu) -> bool {
                 It::Pick => format!("Cherry-pick onto {}", m.branch),
                 It::Revert => "Revert".into(),
                 It::Reset => format!("Reset {} to here…", m.branch),
+                It::Compare => format!("Compare with {}", other.as_deref().map_or("", |x| &x[..x.len().min(7)])),
+                It::Mark if m.marked.as_deref() == Some(m.hash.as_str()) => "Unmark".into(),
+                It::Mark => "Mark for comparison".into(),
                 It::Untag(t) => format!("Delete tag {}", m.tags[t]),
                 It::Copy => "Copy hash".into(),
             };
@@ -6329,6 +6617,8 @@ fn commit_menu(app: &mut App, ctx: &egui::Context, m: &mut CommitMenu) -> bool {
             let resp = match it {
                 _ if off(it) => resp.on_hover_text("HEAD is on this commit"),
                 It::Revert => resp.on_hover_text("A new commit that undoes this one"),
+                It::Compare => resp.on_hover_text("The commits each has that the other doesn't, and the files that differ"),
+                It::Mark => resp.on_hover_text("Then another commit's menu compares with this one"),
                 _ => resp,
             };
             if resp.clicked() && !off(it) {
@@ -6353,6 +6643,18 @@ fn commit_menu(app: &mut App, ctx: &egui::Context, m: &mut CommitMenu) -> bool {
             let choices = vec![("Keep changes".to_string(), false, go(false)), ("Discard changes".to_string(), true, go(true))];
             let sub = format!("Commits after {h} leave {b}. Keep changes leaves what they changed in your files; Discard changes resets the files too, keeping uncommitted work in the stash.");
             app.popup = Popup::Choose { msg: format!("Reset {b} to {h}?"), sub, choices };
+        }
+        It::Compare => {
+            if let (Some(x), Some(hist)) = (other, history_in(app, m.panel)) {
+                hist.compare([x[..x.len().min(7)].to_string(), h], [x, hash], true);
+            }
+        }
+        It::Mark => {
+            let unmark = m.marked.as_deref() == Some(hash.as_str());
+            if let Some(hist) = history_in(app, m.panel) {
+                hist.mark = (!unmark).then_some(hash);
+            }
+            app.toast(if unmark { format!("Unmarked {h}") } else { format!("Marked {h}: another commit's menu compares with it") });
         }
         It::Untag(t) => start(app, Op::DeleteTag(m.tags[t].clone()), format!("Couldn't delete the tag {}", m.tags[t])),
         It::Copy => {
@@ -6546,6 +6848,7 @@ fn opt_flip(c: &mut crate::config::Config, o: Opt) -> bool {
         Opt::SelectionBoxes => &mut c.selection_boxes,
         Opt::SystemIcons => &mut c.system_icons,
         Opt::ThumbFill => &mut c.thumb_fill,
+        Opt::CheckCopies => &mut c.check_copies,
         Opt::ScrollBeyond => &mut c.scroll_beyond,
         Opt::ActOnPress => &mut c.act_on_press,
         Opt::SingleClick => &mut c.single_click,

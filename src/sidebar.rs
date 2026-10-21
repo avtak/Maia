@@ -1,5 +1,5 @@
-//! Quick access sidebar: header (menu, collapse), filter, then Recents, Bookmarks,
-//! Storage (with fill bars) and Places, each collapsible.
+//! Quick access sidebar: header (menu, collapse), filter, then Recents, Bookmarks, Smart
+//! Folders, Tags, Storage (with fill bars), Network and Places, each collapsible.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -122,6 +122,11 @@ pub fn known(app: &App, ctx: &egui::Context) -> Known {
         dirs.extend(c.marks.iter().filter(|(p, (exists, _))| *exists && !c.files.contains(*p)).map(|(p, _)| p.clone()));
         Known { generation: c.generation, mounts: c.mounts.clone(), recents: c.recents.clone(), places: c.places.clone(), dirs }
     })
+}
+
+/// Where the mounted drives are, as of the last refresh.
+pub fn mount_points() -> Vec<PathBuf> {
+    CACHE.with(|c| c.borrow().mounts.iter().map(|m| m.0.clone()).collect())
 }
 
 /// Generation of the cached refresh (cheap; no copies).
@@ -482,6 +487,47 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
             }
             ui.add_space(6.0);
         } else if !app.ud.smart.is_empty() {
+            ui.add_space(6.0);
+        }
+        // ---------------- tags, once some file has one
+        if !app.ud.tags.is_empty() && section(ui, app, "tags", "Tags", Glyph::Tag) {
+            for tag in crate::tags::ordered(&app.ud.tags) {
+                if !matches(&tag) {
+                    continue;
+                }
+                let id = crate::smart::tag_id(&tag);
+                let key = crate::ctxmenu::smart_key(id);
+                let (r, resp) = ui.allocate_exact_size(vec2(width, row_h), Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tag));
+                let r2 = r.shrink2(vec2(6.0, 1.0));
+                if ctx_target.as_deref() == Some(key.as_path()) {
+                    ui.painter().rect_filled(r2, CornerRadius::same(5), pal.selected);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r2, CornerRadius::same(5), pal.row_hover);
+                }
+                let ic = Rect::from_center_size(pos2(r.left() + 36.0, r.center().y), Vec2::splat(15.0));
+                match crate::tags::color_of(&tag) {
+                    Some(c) => {
+                        ui.painter().circle_filled(ic.center(), 5.0, c);
+                    }
+                    None => paint_glyph(ui.painter(), ic.shrink(1.0), Glyph::Tag, pal.text_dim),
+                }
+                let g = crate::listing::elided(ui, &tag, font.clone(), r.width() - 62.0, pal.text);
+                ui.painter().galley(pos2(r.left() + 52.0, r.center().y - g.size().y / 2.0), g, pal.text);
+                let resp = resp.on_hover_text(format!("Everything tagged “{tag}” in your home folder\nCtrl+click: open in a new tab"));
+                if resp.clicked() {
+                    actions.push(Action::OpenSmart { panel: active, id, new_tab: mods.ctrl, focus: true });
+                }
+                if resp.middle_clicked() {
+                    actions.push(Action::OpenSmart { panel: active, id, new_tab: true, focus: false });
+                }
+                if resp.secondary_clicked() {
+                    let pos = resp.interact_pointer_pos().unwrap_or(r.left_bottom());
+                    actions.push(Action::Open(crate::ctxmenu::build_tag(active, &tag, pos)));
+                }
+            }
+            ui.add_space(6.0);
+        } else if !app.ud.tags.is_empty() {
             ui.add_space(6.0);
         }
         // ---------------- storage

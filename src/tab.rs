@@ -8,7 +8,6 @@ use std::time::SystemTime;
 
 use crate::config::{GroupBy, SaveScope, SortKey, ViewSettings};
 use crate::fsx::{self, DEAD, Entry, Listing, Walk};
-use crate::fuzzy;
 use crate::rename::Rename;
 use crate::stats::DirStats;
 
@@ -127,6 +126,8 @@ pub struct Tab {
     pub git_only: Option<std::sync::Arc<HashSet<PathBuf>>>,
     /// The status answer `git_only` was made from.
     pub git_only_from: Option<std::rc::Rc<crate::gitstatus::Repo>>,
+    /// In a picker window: the files the app's filter lets through (folders always pass).
+    pub pick: Option<std::sync::Arc<crate::picker::Accept>>,
     /// In a trash folder: original location and deletion time per item.
     pub trash_meta: HashMap<PathBuf, (PathBuf, Option<SystemTime>)>,
     /// Tree-view context rows: ancestors kept only to show where filter matches live (drawn dimmed).
@@ -171,6 +172,8 @@ pub struct Tab {
     pub check_drag: Option<bool>,
     /// The filter's contents mode and its running search.
     pub content: crate::contentsearch::State,
+    /// The Columns view's other folders (made when it is first drawn).
+    pub strip: Option<Box<crate::columns::Strip>>,
 }
 
 /// Rubber-band selection in content coordinates.
@@ -225,6 +228,7 @@ impl Tab {
             only_changed: false,
             git_only: None,
             git_only_from: None,
+            pick: None,
             gone: false,
             archive: None,
             dimmed: HashSet::new(),
@@ -254,6 +258,7 @@ impl Tab {
             cursor_first: true,
             check_drag: None,
             content: Default::default(),
+            strip: None,
         };
         t.reload();
         t
@@ -462,7 +467,7 @@ impl Tab {
 
     /// Is the tree view active (Details view, not flattened)?
     pub fn tree_active(&self) -> bool {
-        !self.flatten && crate::listing::mode_for(self.settings.zoom) == crate::listing::Mode::Tree && !is_computer(&self.path) && self.archive.is_none()
+        !self.flatten && crate::listing::mode_of(&self.settings) == crate::listing::Mode::Tree && !is_computer(&self.path) && self.archive.is_none()
     }
 
     pub fn toggle_expand(&mut self, dir: &Path) {
@@ -521,7 +526,17 @@ impl Tab {
     /// tab of each panel and never a flattened walk, so without this a tab behind
     /// another or a flattened listing keeps showing what was moved out of it.
     pub fn changed(&mut self, c: &crate::ops::Changed) {
-        if self.archive.is_some() || is_computer(&self.path) || self.rename.is_some() {
+        if let Some(s) = self.strip.as_mut() {
+            s.changed(c);
+        }
+        // Inside an archive: read again when a change was made to it.
+        if let Some(a) = &self.archive {
+            if self.rename.is_none() && c.arrived.iter().any(|d| d == a) {
+                self.reload();
+            }
+            return;
+        }
+        if is_computer(&self.path) || self.rename.is_some() {
             return;
         }
         if c.gone.iter().any(|g| self.path.starts_with(g)) {
@@ -701,6 +716,9 @@ impl Tab {
         match settings {
             Some((s, scope)) => {
                 let before = std::mem::replace(&mut self.settings, s);
+                // Browsing in Columns stays in Columns: a folder's saved view lends it
+                // its sort, not a view that would take the columns away.
+                self.settings.column_view |= before.column_view;
                 self.free_view.get_or_insert(before);
                 self.saved_scope = scope;
             }
@@ -968,14 +986,26 @@ impl Tab {
         self.stream_dirty = false;
         self.built_tree = self.tree_active();
         let walking = self.walk.as_ref().map(|w| !w.done.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false);
+        // Parsed once per rebuild, so ages count from now; the rows only run the result.
         let fq = crate::query::parse(&self.filter, std::time::SystemTime::now());
-        let q = fuzzy::Query::new(if content.is_some() { "" } else { &fq.name });
+        let fcx = crate::query::Cx::view(c.stats, if content.is_some() { crate::query::Text::Off } else { crate::query::Text::Full });
+        // A smart folder's words rank its files as the filter ranked them when it was
+        // saved, until the filter has words of its own.
+        let rank = self.smart.as_ref().filter(|s| s.tag.is_empty() && !fq.ranked(&fcx)).map(|s| crate::query::parse(&s.query_text(), std::time::SystemTime::now())).filter(|r| r.ranked(&fcx));
+        let ranked = fq.ranked(&fcx) || rank.is_some();
+        if fq.pending {
+            // An owner's name waits for the list of users: look again shortly.
+            self.stream_dirty = true;
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
         let only: HashSet<String> = self.settings.only_types.iter().cloned().collect();
         let (show_folders, show_files) = (self.settings.show_folders, self.settings.show_files);
-        let flatten = self.flatten;
+        // A flattened walk lists every folder on the way; a tag's view lists those tagged.
+        let flatten = self.flatten && !self.smart.as_ref().is_some_and(|s| !s.tag.is_empty());
         let db = crate::mime::mime_db();
         let (git_hide, here) = (self.git_hide.clone(), self.path.clone());
         let git_only = self.git_only.clone();
+        let pick = self.pick.clone();
         let hidden_ok = |e: &Entry| -> bool {
             if !c.show_hidden && (e.hidden || e.rel_hidden()) {
                 return false;
@@ -997,7 +1027,7 @@ impl Tab {
             if content.is_some_and(|h| e.is_dir || !h.contains_key(&e.path)) {
                 return false;
             }
-            if fq.has_conds() && !fq.ok(e, c.stats) {
+            if pick.as_ref().is_some_and(|a| !a.ok(e)) {
                 return false;
             }
             only.is_empty() || only.contains(e.special_kind().map(String::from).unwrap_or_else(|| db.label(&e.name, &e.ext(), e.is_dir, e.is_executable())).as_str())
@@ -1009,10 +1039,11 @@ impl Tab {
         // Fuzzy score of each entry in `top` (same order), when filtering.
         let mut scores: Vec<i32> = vec![];
         let tree_view = self.tree_active();
-        let tree = tree_view && q.is_empty() && only.is_empty() && content.is_none() && !fq.has_conds();
+        let tree = tree_view && fq.is_empty() && only.is_empty() && content.is_none() && pick.is_none();
         self.dimmed.clear();
         if tree_view && !tree {
-            self.rebuild_tree_filtered(c, &q, &hidden_ok, &row_ok);
+            let ncx = crate::query::Cx::view(c.stats, crate::query::Text::Name);
+            self.rebuild_tree_filtered(c, &|e| fq.score(e, &ncx).is_some(), &hidden_ok, &row_ok);
             return;
         }
         // Big flat lists (a flattened folder): filter and score in parallel chunks, then
@@ -1020,7 +1051,7 @@ impl Tab {
         if !tree && self.entries.len() >= 40_000 {
             let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1).clamp(1, 8);
             let chunk = self.entries.len().div_ceil(threads);
-            let (hidden_ok, row_ok, q) = (&hidden_ok, &row_ok, &q);
+            let (hidden_ok, row_ok, fq, fcx, rank) = (&hidden_ok, &row_ok, &fq, &fcx, &rank);
             let parts: Vec<(Vec<u32>, Vec<i32>, usize, usize, usize)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = self
                     .entries
@@ -1042,13 +1073,10 @@ impl Tab {
                                 if !row_ok(e) {
                                     continue;
                                 }
-                                if !q.is_empty() {
-                                    let name_score = fuzzy::score(q, e.lname()).map(|s| s + 40);
-                                    let path_score = e.rel().as_ref().and_then(|r| fuzzy::score_ci(q, r));
-                                    match name_score.max(path_score) {
-                                        Some(sc) => scores.push(sc),
-                                        None => continue,
-                                    }
+                                match fq.score(e, fcx) {
+                                    Some(sc) if ranked => scores.push(rank.as_ref().map_or(Some(sc), |r| r.score(e, fcx)).unwrap_or(0)),
+                                    Some(_) => {}
+                                    None => continue,
                                 }
                                 top.push(i);
                             }
@@ -1084,14 +1112,10 @@ impl Tab {
             if !row_ok(e) {
                 continue;
             }
-            if !q.is_empty() {
-                // Name matches rank above matches that only hit the relative path.
-                let name_score = fuzzy::score(&q, &e.lname()).map(|s| s + 40);
-                let path_score = e.rel().as_ref().and_then(|r| fuzzy::score_ci(&q, r));
-                match name_score.max(path_score) {
-                    Some(sc) => scores.push(sc),
-                    None => continue,
-                }
+            match fq.score(e, &fcx) {
+                Some(sc) if ranked => scores.push(rank.as_ref().map_or(Some(sc), |r| r.score(e, &fcx)).unwrap_or(0)),
+                Some(_) => {}
+                None => continue,
             }
             top.push(i as u32);
         }
@@ -1115,7 +1139,7 @@ impl Tab {
     /// Searched are the items currently shown in the tree (top level plus unfolded
     /// folders); a folder that does not match itself but leads to a match is kept as
     /// dimmed context, so you can see where each match lives.
-    fn rebuild_tree_filtered(&mut self, c: &ViewCtx, q: &fuzzy::Query, hidden_ok: &dyn Fn(&Entry) -> bool, row_ok: &dyn Fn(&Entry) -> bool) {
+    fn rebuild_tree_filtered(&mut self, c: &ViewCtx, q: &dyn Fn(&Entry) -> bool, hidden_ok: &dyn Fn(&Entry) -> bool, row_ok: &dyn Fn(&Entry) -> bool) {
         let walking = self.walk.as_ref().map(|w| !w.done.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false);
         // Only ever asked for ancestor folders: index those (thousands), not every entry.
         let by_path: HashMap<&Path, u32> = self.entries.iter().enumerate().filter(|(_, e)| e.depth != DEAD && e.is_dir).map(|(i, e)| (e.path.as_path(), i as u32)).collect();
@@ -1153,7 +1177,7 @@ impl Tab {
             } else if !hidden_ok(e) {
                 continue;
             }
-            if !row_ok(e) || (!q.is_empty() && fuzzy::score(q, &e.lname()).is_none()) || !reachable(e) {
+            if !row_ok(e) || !q(e) || !reachable(e) {
                 continue;
             }
             matched.insert(i as u32);
@@ -1207,6 +1231,14 @@ impl Tab {
                 (ns as u64) ^ (1 << 63) // order-preserving signed -> unsigned
             };
             let stat = |e: &Entry| c.stats.get(&e.path);
+            // Keys read from caches filled off this thread; an item without one goes last
+            // either way round.
+            let keyed: Option<Vec<Option<u64>>> = match s.sort {
+                SortKey::Tags => Some(crate::tags::sort_keys(top.iter().map(|&i| entries[i as usize].path.as_path()))),
+                SortKey::Taken | SortKey::Dimensions | SortKey::Duration => Some(top.iter().map(|&i| crate::facts::sort_key(&entries[i as usize], s.sort)).collect()),
+                _ => None,
+            };
+            let by_name = |a: &u32, b: &u32| compare(&entries[*a as usize], &entries[*b as usize], SortKey::Name, s.desc, c, tm);
             let primary = |e: &Entry| -> Option<u64> {
                 Some(match s.sort {
                     SortKey::Name => 0,
@@ -1217,10 +1249,10 @@ impl Tab {
                     SortKey::Folders => stat(e).map(|x| x.folders as u64).unwrap_or(0),
                     SortKey::Files => stat(e).map(|x| x.files as u64).unwrap_or(0),
                     SortKey::Deleted => when(tm.get(&e.path).and_then(|t| t.1)),
-                    SortKey::Type | SortKey::Original => return None,
+                    SortKey::Type | SortKey::Original | SortKey::Tags | SortKey::Taken | SortKey::Dimensions | SortKey::Duration => return None,
                 })
             };
-            if !matches!(s.sort, SortKey::Type | SortKey::Original) {
+            if !matches!(s.sort, SortKey::Type | SortKey::Original) || keyed.is_some() {
                 // Name tie-break: the first 16 bytes of the lowercase name. Where two
                 // prefixes first differ, byte order equals natural order unless a number is
                 // being compared there (a digit at that byte or just before it); only
@@ -1237,8 +1269,12 @@ impl Tab {
                         // Recents on top (one lookup per item, not per comparison), then
                         // folders-first.
                         let recent = c.recents_on_top && c.recents.contains(&e.path);
-                        let rank = if recent { 0 } else { 2 } + if e.is_dir == c.folders_first { 0 } else { 1 };
-                        (tier(k), rank, primary(e).unwrap_or(0), u128::from_be_bytes(p), i)
+                        let (missing, key) = match &keyed {
+                            Some(v) => (v[k].is_none(), v[k].unwrap_or(0)),
+                            None => (false, primary(e).unwrap_or(0)),
+                        };
+                        let rank = if recent { 0 } else { 4 } + if e.is_dir == c.folders_first { 0 } else { 2 } + missing as u8;
+                        (tier(k), rank, key, u128::from_be_bytes(p), i)
                     })
                     .collect();
                 par_sort_by(&mut dec, &|a: &(i32, u8, u64, u128, u32), b: &(i32, u8, u64, u128, u32)| {
@@ -1255,7 +1291,8 @@ impl Tab {
                                 return if s.desc { o.reverse() } else { o };
                             }
                         }
-                        cmp(&a.4, &b.4)
+                        // The key read from a cache is settled already: by name from here.
+                        if keyed.is_some() { by_name(&a.4, &b.4) } else { cmp(&a.4, &b.4) }
                     })
                 });
                 top = dec.into_iter().map(|d| d.4).collect();
@@ -1348,7 +1385,8 @@ impl Tab {
         // A flattened walk can be huge and is not grouped; the Timeline is bounded by its
         // month and reads by day.
         let timeline = self.smart.as_ref().is_some_and(|s| s.id == crate::smart::TIMELINE);
-        if self.settings.group == GroupBy::None || (self.flatten && !timeline) {
+        // Columns lists each folder in one run, as its other columns do.
+        if self.settings.group == GroupBy::None || self.settings.column_view || (self.flatten && !timeline) {
             ordered.push((None, top));
         } else {
             let mut order: Vec<String> = vec![];
@@ -1619,6 +1657,18 @@ fn compare(a: &Entry, b: &Entry, key: SortKey, desc: bool, c: &ViewCtx, trash: &
         SortKey::Original => trash.get(&a.path).map(|t| t.0.as_path()).cmp(&trash.get(&b.path).map(|t| t.0.as_path())),
         SortKey::Folders => c.stats.get(&a.path).map(|s| s.folders).unwrap_or(0).cmp(&c.stats.get(&b.path).map(|s| s.folders).unwrap_or(0)),
         SortKey::Files => c.stats.get(&a.path).map(|s| s.files).unwrap_or(0).cmp(&c.stats.get(&b.path).map(|s| s.files).unwrap_or(0)),
+        SortKey::Tags => {
+            let lead = |p: &Path| crate::tags::get(p, |t| crate::tags::leading(t).map(|l| (crate::tags::rank(l), l.to_lowercase()))).flatten();
+            match (lead(&a.path), lead(&b.path)) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                // Without one last, whichever way round.
+                (x, y) => return y.is_none().cmp(&x.is_none()).reverse().then_with(|| natural_cmp(a.lname(), b.lname())),
+            }
+        }
+        SortKey::Taken | SortKey::Dimensions | SortKey::Duration => match (crate::facts::sort_key(a, key), crate::facts::sort_key(b, key)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (x, y) => return y.is_none().cmp(&x.is_none()).reverse().then_with(|| natural_cmp(a.lname(), b.lname())),
+        },
     };
     let o = o.then_with(|| natural_cmp(&a.lname(), &b.lname()));
     if desc { o.reverse() } else { o }
@@ -1727,6 +1777,10 @@ fn group_label(e: &Entry, g: GroupBy, c: &GroupCtx) -> String {
             None => "Unknown".into(),
         },
         GroupBy::FileSystem => c.vols.get(&e.path).map(|v| v.fstype.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Unknown".into()),
+        // The first tag only: an item shows once, under the tag it sorts by.
+        GroupBy::Tag => crate::tags::get(&e.path, |t| crate::tags::leading(t).cloned()).flatten().unwrap_or_else(|| NO_TAGS.into()),
+        // By the month: photos span years, and a day's group would hold a handful.
+        GroupBy::Taken => crate::facts::month_label(e),
         GroupBy::PercentFull => match c.vols.get(&e.path) {
             Some(v) if v.total > 0 => match (v.total - v.free) as f64 / v.total as f64 {
                 f if f >= 0.9 => "Nearly full (90%+)".into(),
@@ -1738,7 +1792,15 @@ fn group_label(e: &Entry, g: GroupBy, c: &GroupCtx) -> String {
     }
 }
 
+const NO_TAGS: &str = "No tags";
+
 fn group_rank(l: &str, g: GroupBy) -> usize {
+    if g == GroupBy::Tag {
+        return if l == NO_TAGS { 99 } else { crate::tags::rank(l) as usize };
+    }
+    if g == GroupBy::Taken {
+        return crate::facts::month_rank(l);
+    }
     let order: &[&str] = match g {
         GroupBy::Name => &["A – H", "I – P", "Q – Z", "Other"],
         GroupBy::Type => &["Folder"],
@@ -1748,7 +1810,7 @@ fn group_rank(l: &str, g: GroupBy) -> usize {
         GroupBy::Usage => &["Over half", "10 – 50%", "1 – 10%", "< 1%"],
         GroupBy::FreeSpace => &["Under 1 GB free", "1 – 10 GB free", "10 – 100 GB free", "Over 100 GB free", "Unknown"],
         GroupBy::PercentFull => &["Nearly full (90%+)", "Over half full", "Under half full", "Unknown"],
-        GroupBy::None | GroupBy::Original | GroupBy::FileSystem => &[],
+        GroupBy::None | GroupBy::Original | GroupBy::FileSystem | GroupBy::Tag | GroupBy::Taken => &[],
     };
     order.iter().position(|o| *o == l).unwrap_or(if g == GroupBy::Type { 1 } else { 99 })
 }

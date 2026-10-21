@@ -193,6 +193,8 @@ pub struct Config {
     pub inspector_font: String,
     pub thumbnails: ThumbMode,
     pub thumb_fill: bool,
+    /// Every copy read back from the disk and compared with what was copied.
+    pub check_copies: bool,
     pub scroll_beyond: bool,
     pub date_format: String,
     // Mouse & keyboard
@@ -274,6 +276,7 @@ impl Default for Config {
             inspector_font: String::new(),
             thumbnails: ThumbMode::LocalDisks,
             thumb_fill: false,
+            check_copies: false,
             scroll_beyond: false,
             date_format: "%x %H:%M".into(),
             act_on_press: true,
@@ -326,11 +329,18 @@ pub enum SortKey {
     Accessed,
     Deleted,
     Original,
+    /// By each item's first tag: the colour labels in their order, then the words.
+    Tags,
+    /// When a photo was taken or a film made.
+    Taken,
+    /// A picture's or a film's pixels.
+    Dimensions,
+    Duration,
 }
 
 impl SortKey {
     pub fn default_desc(self) -> bool {
-        !matches!(self, SortKey::Name | SortKey::Type | SortKey::Original)
+        !matches!(self, SortKey::Name | SortKey::Type | SortKey::Original | SortKey::Tags)
     }
 }
 
@@ -351,10 +361,14 @@ pub enum Column {
     Deleted,
     /// Trash only: the folder it was deleted from.
     Original,
+    Tags,
+    Taken,
+    Dimensions,
+    Duration,
 }
 
 impl Column {
-    pub const ALL: [Column; 13] = [
+    pub const ALL: [Column; 17] = [
         Column::Name,
         Column::Type,
         Column::Size,
@@ -368,6 +382,10 @@ impl Column {
         Column::Accessed,
         Column::Deleted,
         Column::Original,
+        Column::Tags,
+        Column::Taken,
+        Column::Dimensions,
+        Column::Duration,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -384,6 +402,10 @@ impl Column {
             Column::Accessed => "Date Accessed",
             Column::Deleted => "Date Deleted",
             Column::Original => "Original Location",
+            Column::Tags => "Tags",
+            Column::Taken => "Date Taken",
+            Column::Dimensions => "Dimensions",
+            Column::Duration => "Duration",
         }
     }
     pub fn sort_key(self) -> Option<SortKey> {
@@ -399,6 +421,10 @@ impl Column {
             Column::Accessed => SortKey::Accessed,
             Column::Deleted => SortKey::Deleted,
             Column::Original => SortKey::Original,
+            Column::Tags => SortKey::Tags,
+            Column::Taken => SortKey::Taken,
+            Column::Dimensions => SortKey::Dimensions,
+            Column::Duration => SortKey::Duration,
             Column::Permissions => return None,
         })
     }
@@ -413,10 +439,14 @@ impl Column {
             Column::Usage => 120.0,
             Column::Permissions => 100.0,
             Column::Extension => 80.0,
+            Column::Tags => 140.0,
+            Column::Taken => 140.0,
+            Column::Dimensions => 110.0,
+            Column::Duration => 80.0,
         }
     }
     pub fn right_aligned(self) -> bool {
-        matches!(self, Column::Size | Column::Folders | Column::Files)
+        matches!(self, Column::Size | Column::Folders | Column::Files | Column::Dimensions | Column::Duration)
     }
 }
 
@@ -445,6 +475,10 @@ pub enum GroupBy {
     FileSystem,
     /// Computer only.
     PercentFull,
+    /// By each item's first tag (as the Tags sort orders them).
+    Tag,
+    /// By the month a photo was taken or a film made, newest first.
+    Taken,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -459,6 +493,9 @@ pub struct ViewSettings {
     pub only_types: Vec<String>,
     pub show_folders: bool,
     pub show_files: bool,
+    /// The Columns view: one column per folder level. It sits beside the zoom axis and
+    /// leaves `zoom` as it was.
+    pub column_view: bool,
 }
 
 impl Default for ViewSettings {
@@ -475,6 +512,7 @@ impl Default for ViewSettings {
             only_types: vec![],
             show_folders: true,
             show_files: true,
+            column_view: false,
         }
     }
 }
@@ -563,6 +601,10 @@ pub struct UserData {
     pub smart: Vec<crate::smart::SmartFolder>,
     /// The newest version started (the welcome tour and What's New are shown once).
     pub seen_version: String,
+    /// Tags and colour labels known to be on some file, for the sidebar.
+    pub tags: Vec<String>,
+    /// Folders Copy To… and Move To… sent things into, newest first.
+    pub destinations: Vec<PathBuf>,
 }
 
 impl UserData {

@@ -185,16 +185,68 @@ pub fn fmt_count(n: usize) -> String {
     out
 }
 
-/// The table and what drawing it needs to remember: column widths for a font size.
+/// The table and what drawing it needs to remember: column widths for a font size, and
+/// the cells selected.
 pub struct TableView {
     pub t: Table,
     widths: Option<(f32, Vec<f32>)>,
+    /// A rectangle of cells, between two corners (row, column).
+    pub sel: Option<crate::textsel::Sel<(usize, usize)>>,
+    grab: Grab,
+}
+
+/// What the selection was taken by: cells, whole rows (their numbers), whole columns
+/// (their titles), or all of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grab {
+    Cells,
+    Rows,
+    Cols,
+    All,
 }
 
 impl TableView {
     pub fn new(t: Table) -> TableView {
-        TableView { t, widths: None }
+        TableView { t, widths: None, sel: None, grab: Grab::Cells }
     }
+
+    pub fn select_all(&mut self) -> bool {
+        if self.t.rows.is_empty() || self.t.cols == 0 {
+            return false;
+        }
+        self.sel = Some(crate::textsel::Sel::new((0, 0), (self.t.rows.len() - 1, self.t.cols - 1)));
+        self.grab = Grab::All;
+        true
+    }
+
+    /// The selected cells' (first row, first column) and (last row, last column).
+    pub fn sel_rect(&self) -> Option<((usize, usize), (usize, usize))> {
+        corners(self.sel)
+    }
+
+    /// The cells selected as tab-separated lines, as spreadsheets paste them: a field
+    /// holding a tab, a line break or a quote in quotes. Whole columns bring their titles.
+    pub fn copy_text(&self) -> String {
+        let Some(((r0, c0), (r1, c1))) = self.sel_rect() else { return String::new() };
+        let field = |s: &str| if s.contains(['\t', '\n', '\r', '"']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() };
+        let line = |cells: &[String]| (c0..=c1).map(|c| cells.get(c).map_or(String::new(), |s| field(s))).collect::<Vec<_>>().join("\t");
+        let mut out = vec![];
+        if matches!(self.grab, Grab::Cols | Grab::All) {
+            if let Some(h) = &self.t.header {
+                out.push(line(h));
+            }
+        }
+        for r in r0..=r1.min(self.t.rows.len().saturating_sub(1)) {
+            out.push(line(&self.t.rows[r]));
+        }
+        out.join("\n")
+    }
+}
+
+fn corners(s: Option<crate::textsel::Sel<(usize, usize)>>) -> Option<((usize, usize), (usize, usize))> {
+    let s = s?;
+    let ((a, b), (c, d)) = (s.anchor, s.head);
+    Some(((a.min(c), b.min(d)), (a.max(c), b.max(d))))
 }
 
 /// A cell's text on one line.
@@ -258,8 +310,9 @@ pub fn view(ui: &mut Ui, body: Rect, v: &mut TableView, size: f32, pal: &Palette
     let n = t.rows.len() + usize::from(t.note.is_some());
     let mut inner = ui.new_child(UiBuilder::new().max_rect(body.shrink2(vec2(2.0, 2.0))));
     let lift = ((row_h - ui.fonts_mut(|f| f.row_height(&font))) / 2.0).floor().max(0.0);
+    let (mut sel, mut grab) = (v.sel, v.grab);
     egui::ScrollArea::both().auto_shrink([false, false]).id_salt(("table", id)).show_viewport(&mut inner, |ui, vp| {
-        let (r, resp) = ui.allocate_exact_size(vec2(total_w.max(vp.width()), (n + 1) as f32 * row_h + 4.0), Sense::hover());
+        let (r, resp) = ui.allocate_exact_size(vec2(total_w.max(vp.width()), (n + 1) as f32 * row_h + 4.0), Sense::click_and_drag());
         let clip = ui.clip_rect();
         let p = ui.painter().clone();
         // Rows below the sticky header, cells right of the sticky row numbers.
@@ -281,6 +334,52 @@ pub fn view(ui: &mut Ui, body: Rect, v: &mut TableView, size: f32, pal: &Palette
         let first = ((vp.min.y / row_h).floor() as usize).min(n);
         let last = (((vp.max.y / row_h).ceil() as usize) + 1).min(n);
         let hover = resp.hover_pos();
+        // Cells under the mouse: a press picks one (a row by its number, a column by its
+        // title), Shift stretches what is picked, a drag stretches it as it goes.
+        if !t.rows.is_empty() {
+            let (pressed, down, shift, origin, pos) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.shift, i.pointer.press_origin(), i.pointer.interact_pos()));
+            let (rows, cols) = (t.rows.len(), t.cols);
+            let at = |pp: egui::Pos2| {
+                let row = (((pp.y - r.top()) / row_h).floor() as isize - 1).clamp(0, rows as isize - 1) as usize;
+                let col = xs.partition_point(|&x| x <= pp.x).saturating_sub(1).min(cols - 1);
+                (row, col, pp.y < head_y + row_h, pp.x < num_x + gutter)
+            };
+            let on = resp.is_pointer_button_down_on();
+            if let Some(o) = origin.filter(|_| pressed && on) {
+                let (row, col, head, nums) = at(o);
+                match sel.as_mut() {
+                    Some(s) if shift => {
+                        s.head = match grab {
+                            Grab::Rows => (row, cols - 1),
+                            Grab::Cols => (rows - 1, col),
+                            _ => (row, col),
+                        }
+                    }
+                    _ => {
+                        let (g, a, b) = match (head, nums) {
+                            (true, true) => (Grab::All, (0, 0), (rows - 1, cols - 1)),
+                            (true, false) => (Grab::Cols, (0, col), (rows - 1, col)),
+                            (false, true) => (Grab::Rows, (row, 0), (row, cols - 1)),
+                            (false, false) => (Grab::Cells, (row, col), (row, col)),
+                        };
+                        grab = g;
+                        sel = Some(crate::textsel::Sel::new(a, b));
+                    }
+                }
+            } else if let (true, true, Some(pp)) = (on, down, pos) {
+                let (row, col, ..) = at(pp);
+                if let Some(s) = sel.as_mut() {
+                    s.head = match grab {
+                        Grab::Rows => (row, cols - 1),
+                        Grab::Cols => (rows - 1, col),
+                        Grab::All => s.head,
+                        Grab::Cells => (row, col),
+                    };
+                }
+                crate::textsel::autoscroll(ui, pp);
+            }
+        }
+        let picked = corners(sel);
         let mut tip: Option<String> = None;
         let cell_text = |ui: &Ui, painter: &egui::Painter, s: &str, x: f32, w: f32, y: f32, right: bool, col: Color32| -> bool {
             let s = one_line(s);
@@ -300,8 +399,26 @@ pub fn view(ui: &mut Ui, body: Rect, v: &mut TableView, size: f32, pal: &Palette
             }
             let row = &t.rows[i];
             let row_r = Rect::from_min_max(pos2(num_x, y), pos2(r.right().max(num_x + vp.width()), y + row_h));
+            // The row under the pointer, under the selection's block (drawn with the
+            // first row of it on screen).
             if hover.is_some_and(|h| row_r.contains(h) && h.y > head_y + row_h) {
-                nums.rect_filled(row_r, CornerRadius::ZERO, pal.hover);
+                match picked.filter(|((r0, _), (r1, _))| (*r0..=*r1).contains(&i) && i > (*r0).max(first)) {
+                    // Beside the block, not over it.
+                    Some(((_, c0), (_, c1))) => {
+                        nums.rect_filled(Rect::from_min_max(row_r.min, pos2(xs[c0], row_r.bottom())), CornerRadius::ZERO, pal.hover);
+                        nums.rect_filled(Rect::from_min_max(pos2(xs[(c1 + 1).min(t.cols)], row_r.top()), row_r.max), CornerRadius::ZERO, pal.hover);
+                    }
+                    None => {
+                        nums.rect_filled(row_r, CornerRadius::ZERO, pal.hover);
+                    }
+                }
+            }
+            // The selected cells as one block from its first row on screen, so rows
+            // painted apart leave no seam between them.
+            if let Some(((r0, c0), (r1, c1))) = picked.filter(|((r0, _), (r1, _))| i == (*r0).max(first) && i <= *r1) {
+                let bottom = r.top() + (r1.min(last.saturating_sub(1)) + 2) as f32 * row_h;
+                let _ = r0;
+                crate::textsel::paint(&cells, Rect::from_min_max(pos2(xs[c0], y), pos2(xs[(c1 + 1).min(t.cols)], bottom)), pal);
             }
             for c in c0..c1 {
                 let Some(s) = row.get(c) else { continue };
@@ -334,4 +451,5 @@ pub fn view(ui: &mut Ui, body: Rect, v: &mut TableView, size: f32, pal: &Palette
             resp.on_hover_text(s);
         }
     });
+    (v.sel, v.grab) = (sel, grab);
 }
