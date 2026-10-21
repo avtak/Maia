@@ -76,6 +76,7 @@ mod musictags;
 mod namefind;
 mod needs;
 mod network;
+mod rclone;
 mod office;
 mod ollama;
 mod ops;
